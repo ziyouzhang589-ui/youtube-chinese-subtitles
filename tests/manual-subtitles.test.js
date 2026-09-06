@@ -88,6 +88,8 @@ function loadBackground({
   local = {},
   session = {},
   supportsClose = true,
+  supadataStatus = 200,
+  supadataBody = null,
   transcript = [
     { text: "First sentence here.", start: 0, duration: 3 },
     { text: "Second sentence here.", start: 3, duration: 3 },
@@ -118,6 +120,15 @@ function loadBackground({
     }
     if (href.includes("supadata")) {
       calls.supadata += 1;
+      if (supadataStatus !== 200) {
+        return {
+          ok: false,
+          status: supadataStatus,
+          async json() {
+            return supadataBody || {};
+          },
+        };
+      }
       return {
         ok: true,
         status: 200,
@@ -653,4 +664,54 @@ test("a failed fetch is shared, not repeated, by concurrent callers", async () =
   const retry = await bg.send({ action: "fetchTranscript", videoId: VIDEO });
   assert.equal(retry.success, false);
   assert.equal(bg.calls.supadata, 2, "Try Again still retries");
+});
+
+test("a Supadata refusal repeats Supadata's own reason", async () => {
+  const { supadataErrorDetail } = loadBackground().helpers;
+
+  // The two fields sometimes repeat each other; say it once.
+  assert.equal(
+    supadataErrorDetail({ error: "limit-exceeded", message: "Limit exceeded" }),
+    "Limit exceeded",
+  );
+  assert.equal(
+    supadataErrorDetail({
+      message: "Limit exceeded",
+      details: "You have reached your plan's monthly quota limit.",
+    }),
+    "Limit exceeded You have reached your plan's monthly quota limit.",
+  );
+  assert.equal(
+    supadataErrorDetail({ message: "Same", details: "Same" }),
+    "Same",
+  );
+  assert.equal(supadataErrorDetail({}), "");
+  assert.equal(supadataErrorDetail(null), "");
+  assert.equal(supadataErrorDetail({ message: 42, details: [] }), "");
+  assert.ok(supadataErrorDetail({ message: "x".repeat(500) }).length <= 303);
+});
+
+test("a rate-limited fetch tells the reader which limit was hit", async () => {
+  const bg = loadBackground({
+    supadataStatus: 429,
+    supadataBody: {
+      error: "limit-exceeded",
+      message: "Limit exceeded",
+      details: "You have reached your plan's monthly quota limit.",
+    },
+  });
+
+  const result = await bg.send({ action: "fetchTranscript", videoId: VIDEO });
+  assert.equal(result.success, false);
+  assert.equal(result.error, "RATE_LIMITED");
+  // The old copy always blamed a short burst, which sent the reader looking
+  // for a rate limit when the real problem was the monthly quota.
+  assert.match(result.message, /monthly quota limit/);
+  assert.match(result.message, /dash\.supadata\.ai/);
+  assert.doesNotMatch(result.message, /Please wait a minute/);
+
+  // A refusal with no explanation still gives the reader somewhere to look.
+  const bare = loadBackground({ supadataStatus: 429, supadataBody: {} });
+  const bareResult = await bare.send({ action: "fetchTranscript", videoId: VIDEO });
+  assert.match(bareResult.message, /dash\.supadata\.ai/);
 });

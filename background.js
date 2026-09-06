@@ -1287,6 +1287,21 @@ async function getPlayerVideoDetails(tabId) {
  * @param {string} videoId - The YouTube video ID (e.g., "dQw4w9WgXcQ")
  * @returns {Object} - { success, transcript, transcriptText, language } or { success: false, error }
  */
+/**
+ * Supadata's own explanation of a refusal, as one short line. Its payload
+ * carries a human-readable `message` and a more specific `details`, and the
+ * two sometimes repeat each other.
+ */
+function supadataErrorDetail(errorData) {
+  const parts = [errorData?.message, errorData?.details]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+  const unique = parts.filter((part, index) => parts.indexOf(part) === index);
+  if (!unique.length) return "";
+  const text = unique.join(" ").replace(/\s+/g, " ");
+  return text.length > 300 ? `${text.slice(0, 300)}...` : text;
+}
+
 // Requests currently in flight, keyed by video ID. Two independent paths can
 // ask for the same transcript: the side panel opening a video, and the player
 // subtitle button being switched on. Without this, a long video (Supadata
@@ -1401,11 +1416,17 @@ async function fetchTranscriptFromSupadata(videoId) {
         };
       }
       if (response.status === 429) {
+        // Supadata answers 429 with limit-exceeded for two different problems:
+        // too many requests in a short burst, and a monthly quota that is
+        // spent. Its own text says which, so repeat that instead of guessing.
+        // Guessing sent the reader chasing a rate limit that was not there.
+        const detail = supadataErrorDetail(errorData);
         return {
           success: false,
           error: "RATE_LIMITED",
-          message:
-            "Supadata rate limit reached. Please wait a minute and try again.",
+          message: detail
+            ? `Supadata refused the request: ${detail} Check the key in Settings and your remaining credits at dash.supadata.ai.`
+            : "Supadata rate limit reached. Wait a minute and try again, then check your remaining credits at dash.supadata.ai.",
         };
       }
       throw new Error(
@@ -2381,6 +2402,7 @@ async function callAiTranslation(
 // Pure validators are exposed for the repository's Node tests only.
 globalThis.__YTD_TRANSLATION_TESTING__ = {
   handleFetchTranscript,
+  supadataErrorDetail,
   requestAiCompletion,
   callAiTranslation,
   validateTranscriptBatchRequest,
