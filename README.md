@@ -2,6 +2,10 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+> **This is a fork.** The original project is [zarazhangrui/youtube-digest](https://github.com/zarazhangrui/youtube-digest), MIT licensed, Copyright (c) 2026 Zara Zhang. That copyright and the [LICENSE](LICENSE) are kept intact here. Please report issues with this fork here rather than upstream.
+>
+> It branches from upstream **v1.1.5** and does not include upstream v1.2.0 (transcript search and universal translation). The two have diverged rather than fallen behind: upstream still translates automatically, while this fork exists specifically to stop that. See [Subtitle translation is manual](#subtitle-translation-is-manual).
+
 Turn every YouTube video into a resource for deep learning. YouTube Digest brings transcripts, bilingual translation, AI overviews, explanations, and timestamped notes into one Chrome side panel, so you can study ideas and language without losing your place.
 
 - Turn captions into a readable, searchable learning resource.
@@ -90,11 +94,50 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 ## Use YouTube Digest
 
 1. Open a standard YouTube watch page with captions.
-2. Click the YouTube Digest extension icon to open the side panel.
-3. Read the timestamped transcript, or choose **Original**, **中文**, or **双语**.
-4. Open **Overview** when you want AI-generated chapters and key quotes.
-5. Select transcript text when you want an AI explanation.
-6. Save a note from the player or a key quote, then revisit it from **Notes**.
+2. Click the YouTube Digest extension icon to open the side panel. Click it again to close the panel.
+3. Read the timestamped transcript.
+4. Click the subtitle button on the video player to turn translation on. It cycles **关** (off), **中** (Chinese), **双** (bilingual), and every video starts at **关**. Translation runs only while this button is on, so nothing is translated until you ask for it. The side panel's **Original / 中文 / 双语** row then switches between reading views of what has already been translated. It never starts a translation itself, and **中文** and **双语** stay unavailable until the player has produced something to read.
+5. Open **Overview** when you want AI-generated chapters and key quotes.
+6. Select transcript text when you want an AI explanation.
+7. Save a note from the player or a key quote, then revisit it from **Notes**.
+
+## Subtitle translation is manual
+
+This fork exists to make one guarantee: **DeepSeek is called only after you press the subtitle button on the video player.** Nothing else can spend credit.
+
+Upstream, the side panel translated on its own. Opening it, switching videos, reloading a page, or simply scrolling the transcript could each start a batch of requests, and a cached "currently showing Chinese" flag meant that reopening a video you had read before silently translated it again. Watching a few videos could cost real money without a single deliberate click.
+
+### How it behaves now
+
+**The subtitle button on the player is the only entry point.** This button and the subtitles it draws over the video exist only in this fork; upstream has no player overlay at all. It sits at the top right of the video and cycles:
+
+| Step | What happens |
+| --- | --- |
+| **关** to **中** | Authorizes translation for this video. Translates the phrase being spoken plus five more. |
+| **中** to **双** | Shows English above Chinese. Redraws text you already have; sends nothing. |
+| **中** or **双** to **关** | Hides subtitles and stops prefetching. Everything already translated stays cached. |
+
+**Every video starts at 关**, including one you translated last week. Turning it back on replays the cache instead of the provider, so a revisited video costs nothing.
+
+**The side panel never translates.** Its **Original / 中文 / 双语** row switches between reading views of text the panel already holds. **中文** and **双语** stay disabled until the player has produced something to read, and a hint points at the player. Opening the panel, switching videos, following playback, and scrolling the transcript are all free.
+
+**The two switches are independent.** Closing the side panel does not turn off subtitles you enabled on the player, and vice versa. The player keeps translating with the panel closed, because the translation queue lives in the background worker.
+
+**The side panel is manual too.** Click the toolbar icon to open it and click again to close it. It stays open as you move between YouTube videos, and a full browser restart returns it to closed.
+
+### What gets translated, and when
+
+Only the cue being spoken and a five-cue look-ahead, in requests of three cues each. A cue is a short phrase, not a paragraph, so a video you open and abandon costs at most a couple of small calls. Cached cues are never re-sent: the background worker checks the cache when queueing, and again immediately before each request.
+
+### Where the state lives
+
+| State | Stored in | Cleared when |
+| --- | --- | --- |
+| Subtitles, and their Chinese translations | `chrome.storage.local` | After 30 days, or when 20 newer videos push it out |
+| Whether you switched subtitles on | `chrome.storage.session` | The browser quits |
+| Whether the side panel is open | `chrome.storage.session` | The browser quits |
+
+The persistent cache deliberately stores **no display mode**. Content is remembered; the intent to show it is not. An older cache that still carries one is read as off.
 
 ## What works today
 
@@ -138,7 +181,7 @@ A measured 20-minute English talk contained **2,935 spoken English words** and 1
 
 If all input is billed as cache miss, input costs about $0.0046 and output costs about $0.0010 to $0.0013, for a total of about $0.0056 to $0.0059. When much of the repeated system prompt hits DeepSeek's automatic best-effort cache, a realistic lower end is about $0.002 to $0.003. A practical estimate for fully translating this talk is therefore **$0.002 to $0.006 USD, about ¥0.02 to ¥0.04**.
 
-Translation is lazy and progressive. Cached segments are reused, and only rows you request by scrolling into them incur calls. Retries, provider behavior, and pricing changes can increase the final cost.
+Translation is lazy and progressive, and it starts only when you switch the player's subtitle button on. From then on, only the phrase being spoken and a short look-ahead are translated, in requests of three, and cached segments are reused for free. Opening the side panel, switching videos, reloading, or revisiting a video you already translated costs nothing. Retries, provider behavior, and pricing changes can increase the final cost.
 
 ## Remix it with your coding agent
 
@@ -223,4 +266,4 @@ The agent should also reload the unpacked extension in Chrome and test several r
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT, Copyright (c) 2026 Zara Zhang. See [LICENSE](LICENSE). This fork is redistributed under the same license with the original copyright notice intact.
