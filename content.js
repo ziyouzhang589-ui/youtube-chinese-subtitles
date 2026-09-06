@@ -628,10 +628,14 @@ function createDigestButton() {
   const digestButton = document.createElement("button");
   digestButton.id = "ytd-digest-button";
   digestButton.type = "button";
-  digestButton.setAttribute("aria-label", "Open YouTube Digest");
+  // The label names the feature people come here for, but the button itself
+  // only opens the side panel. Subtitles are switched on in the player, so the
+  // tooltip says so rather than implying this is the subtitle toggle.
+  digestButton.setAttribute("aria-label", "打开 YouTube中文字幕及摘要 侧边栏");
+  digestButton.title = "打开侧边栏。播放器字幕请用视频右上角的字幕按钮开启。";
   digestButton.innerHTML = `
     <span class="ytd-digest-icon" style="font-size: 11px;">▶</span>
-    <span class="ytd-digest-label">Digest</span>
+    <span class="ytd-digest-label">字幕</span>
   `;
 
   // Style the button — rounded pill in our terracotta accent, sized to sit

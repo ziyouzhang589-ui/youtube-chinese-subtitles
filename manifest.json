@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "YouTube Digest",
+  "name": "YouTube中文字幕及摘要",
   "version": "1.1.5",
   "minimum_chrome_version": "116",
-  "description": "Turn YouTube videos into learning resources with transcripts, bilingual translation, AI overviews, and notes.",
+  "description": "把 YouTube 视频变成学习资料：播放器中文/双语字幕、带时间戳的字幕全文、AI 概览和笔记。",
   "permissions": ["sidePanel", "storage", "tabs", "scripting"],
   "host_permissions": [
     "https://www.youtube.com/*",
@@ -11,7 +11,7 @@
     "https://api.deepseek.com/*"
   ],
   "action": {
-    "default_title": "Open YouTube Digest",
+    "default_title": "打开或关闭 YouTube中文字幕及摘要",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",

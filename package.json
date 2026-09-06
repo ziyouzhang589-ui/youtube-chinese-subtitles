@@ -1,8 +1,8 @@
 {
-  "name": "youtube-digest",
+  "name": "youtube-chinese-subtitles",
   "version": "1.1.5",
   "private": true,
-  "description": "Turn YouTube videos into learning resources with transcripts, bilingual translation, AI overviews, and notes.",
+  "description": "Chinese and bilingual subtitles on the YouTube player, plus a timestamped transcript, AI overviews, and notes.",
   "license": "MIT",
   "scripts": {
     "test": "node --test tests/*.test.js",
