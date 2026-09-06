@@ -30,6 +30,17 @@ let ytdDigestButton = null;
 let digestButtonObserver = null;
 let digestButtonReconcileTimer = null;
 let digestButtonResizeListenerAdded = false;
+let ytdSubtitleOverlay = null;
+let ytdSubtitleToggle = null;
+let ytdSubtitleTrack = null;
+// Always starts closed. A video never inherits an activation — not from the
+// previous video, not from a cached track, not from a previous browser session.
+let ytdSubtitleMode = "off";
+let ytdSubtitleVideo = null;
+let ytdSubtitleVideoId = "";
+let ytdSubtitleGeneration = 0;
+let ytdSubtitleLastPrefetchAt = 0;
+let ytdSubtitleRetryTimer = null;
 
 // ============================================================
 // INITIALIZATION
@@ -54,6 +65,7 @@ function init() {
   // (YouTube is an SPA, so elements appear/disappear as you navigate)
   setupButtonObserver();
   setupDigestButtonResizeListener();
+  setupPlayerSubtitlesForCurrentVideo();
 }
 
 /**
@@ -163,11 +175,396 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.action === "setSubtitleOverlayTrack") {
+    applySubtitleOverlayTrack(message.track, message.generation);
+    sendResponse({ success: true });
+    return false;
+  }
+
   // Unknown action - still send a response to prevent hanging
   debugLog("[YouTube Digest Content] Unknown action:", message.action);
   sendResponse({ success: false, error: "Unknown action" });
   return false;
 });
+
+// ============================================================
+// PLAYER SUBTITLES — A local overlay synchronized to video time
+// ============================================================
+
+function getYouTubeVideoIdFromLocation() {
+  try {
+    return new URL(window.location.href).searchParams.get("v") || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function normalizePlayerSubtitleMode(mode) {
+  return ["zh", "bilingual", "off"].includes(mode) ? mode : "off";
+}
+
+/** The button cycle: 关 -> 中 -> 双 -> 关. */
+function nextPlayerSubtitleMode(mode) {
+  if (mode === "zh") return "bilingual";
+  if (mode === "bilingual") return "off";
+  return "zh";
+}
+
+function findPlayerSubtitleCue(segments, currentTime) {
+  if (!Array.isArray(segments) || !segments.length) return null;
+  const time = Number(currentTime);
+  if (!Number.isFinite(time)) return null;
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const cue = segments[index];
+    if (Number(cue?.start) > time) continue;
+    const explicitEnd = Number(cue?.end);
+    if (Number.isFinite(explicitEnd)) {
+      return time < explicitEnd ? cue : null;
+    }
+    const nextStart = Number(segments[index + 1]?.start);
+    if (!Number.isFinite(nextStart) || time < nextStart) return cue;
+  }
+  return null;
+}
+
+function getSubtitlePlayerContainer() {
+  return document.querySelector(
+    "#movie_player.html5-video-player, #movie_player, .html5-video-player",
+  );
+}
+
+function subtitleModeLabel(mode) {
+  if (mode === "zh") return "中";
+  if (mode === "bilingual") return "双";
+  return "关";
+}
+
+function ensureSubtitleOverlay() {
+  if (!window.location.pathname.includes("/watch")) return null;
+  const playerContainer = getSubtitlePlayerContainer();
+  if (!playerContainer) return null;
+
+  if (
+    window.getComputedStyle(playerContainer).position === "static" ||
+    !playerContainer.style.position
+  ) {
+    playerContainer.style.position = "relative";
+  }
+
+  if (!ytdSubtitleOverlay || !ytdSubtitleOverlay.isConnected) {
+    ytdSubtitleOverlay = document.createElement("div");
+    ytdSubtitleOverlay.id = "ytd-digest-subtitle-overlay";
+    ytdSubtitleOverlay.setAttribute("aria-live", "polite");
+    ytdSubtitleOverlay.style.cssText = `
+      position: absolute;
+      z-index: 2147483000;
+      left: 7%;
+      right: 7%;
+      bottom: 11%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 5px;
+      pointer-events: none;
+      text-align: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: clamp(16px, 2.1vw, 29px);
+      font-weight: 700;
+      line-height: 1.34;
+      color: #fff;
+      text-shadow: 0 2px 5px rgba(0, 0, 0, 0.95), 0 0 12px rgba(0, 0, 0, 0.85);
+    `;
+    playerContainer.appendChild(ytdSubtitleOverlay);
+  } else if (ytdSubtitleOverlay.parentElement !== playerContainer) {
+    playerContainer.appendChild(ytdSubtitleOverlay);
+  }
+
+  if (!ytdSubtitleToggle || !ytdSubtitleToggle.isConnected) {
+    ytdSubtitleToggle = document.createElement("button");
+    ytdSubtitleToggle.id = "ytd-digest-subtitle-toggle";
+    ytdSubtitleToggle.type = "button";
+    ytdSubtitleToggle.setAttribute("aria-label", "Switch YouTube Digest subtitles");
+    ytdSubtitleToggle.style.cssText = `
+      position: absolute;
+      z-index: 2147483001;
+      top: 16px;
+      right: 92px;
+      min-width: 36px;
+      height: 32px;
+      padding: 0 10px;
+      border: 1px solid rgba(255, 255, 255, 0.46);
+      border-radius: 999px;
+      background: rgba(18, 18, 18, 0.74);
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 2px 9px rgba(0, 0, 0, 0.35);
+    `;
+    ytdSubtitleToggle.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      // 关 -> 中 -> 双 -> 关. Only the first step spends anything: it is the
+      // user explicitly authorizing translation for this video.
+      handlePlayerSubtitleToggle(nextPlayerSubtitleMode(ytdSubtitleMode));
+    });
+    playerContainer.appendChild(ytdSubtitleToggle);
+  } else if (ytdSubtitleToggle.parentElement !== playerContainer) {
+    playerContainer.appendChild(ytdSubtitleToggle);
+  }
+
+  const video = document.querySelector("video.html5-main-video");
+  if (video && video !== ytdSubtitleVideo) {
+    ytdSubtitleVideo = video;
+    ["timeupdate", "seeking", "loadedmetadata", "play", "ratechange"].forEach(
+      (eventName) => video.addEventListener(eventName, onPlayerSubtitleTick),
+    );
+  }
+  return playerContainer;
+}
+
+/**
+ * Playback moved. Redraw the current cue and, only while the user has
+ * subtitles switched on, ask for the next few phrases.
+ */
+function onPlayerSubtitleTick() {
+  updatePlayerSubtitleOverlay();
+  requestSubtitlePrefetch();
+}
+
+function renderPlayerSubtitleLine(text, className) {
+  const line = document.createElement("div");
+  line.className = className;
+  line.textContent = text;
+  line.style.cssText =
+    "max-width: 100%; padding: 3px 9px; border-radius: 6px; background: rgba(0, 0, 0, 0.55);";
+  return line;
+}
+
+function updatePlayerSubtitleOverlay() {
+  if (!ytdSubtitleOverlay) return;
+  // If YouTube swapped videos without us seeing the navigation event, the old
+  // authorization is void — fall back to closed rather than showing stale text.
+  const videoId = getYouTubeVideoIdFromLocation();
+  if (videoId && videoId !== ytdSubtitleVideoId) {
+    setupPlayerSubtitlesForCurrentVideo();
+    return;
+  }
+  ytdSubtitleOverlay.replaceChildren();
+  if (ytdSubtitleMode === "off" || !ytdSubtitleTrack) return;
+
+  const video = document.querySelector("video.html5-main-video");
+  const cue = findPlayerSubtitleCue(
+    ytdSubtitleTrack.segments,
+    video ? video.currentTime : 0,
+  );
+  if (!cue) return;
+
+  if (ytdSubtitleMode === "bilingual") {
+    ytdSubtitleOverlay.appendChild(
+      renderPlayerSubtitleLine(cue.original, "ytd-digest-subtitle-original"),
+    );
+  }
+  if (cue.translated) {
+    ytdSubtitleOverlay.appendChild(
+      renderPlayerSubtitleLine(cue.translated, "ytd-digest-subtitle-translation"),
+    );
+  }
+}
+
+function setPlayerSubtitleMode(mode) {
+  ytdSubtitleMode = normalizePlayerSubtitleMode(mode);
+  if (ytdSubtitleToggle) {
+    ytdSubtitleToggle.textContent = subtitleModeLabel(ytdSubtitleMode);
+    ytdSubtitleToggle.title =
+      ytdSubtitleMode === "zh"
+        ? "中文字幕，点击切换双语"
+        : ytdSubtitleMode === "bilingual"
+          ? "中英双语，点击关闭"
+          : "字幕已关闭，点击开启中文翻译";
+    ytdSubtitleToggle.setAttribute(
+      "aria-pressed",
+      String(ytdSubtitleMode !== "off"),
+    );
+  }
+  updatePlayerSubtitleOverlay();
+}
+
+/**
+ * The user clicked the subtitle button. This is the ONLY path in the extension
+ * that can start a translation, and each transition means something different:
+ *
+ *   关 -> 中   authorize DeepSeek for this video, translate around the playhead
+ *   中 -> 双   redraw what is already translated; costs nothing
+ *   * -> 关    hide subtitles, stop prefetching, keep everything cached
+ */
+async function handlePlayerSubtitleToggle(nextMode) {
+  const videoId = getYouTubeVideoIdFromLocation();
+  const mode = normalizePlayerSubtitleMode(nextMode);
+  if (!videoId) return;
+
+  if (mode === "off") {
+    setPlayerSubtitleMode("off");
+    ytdSubtitleTrack = null;
+    chrome.runtime
+      .sendMessage({ action: "deactivateSubtitleTranslation", videoId })
+      .catch(() => {});
+    return;
+  }
+
+  if (ytdSubtitleMode === "off") {
+    setPlayerSubtitleMode(mode);
+    try {
+      const result = await chrome.runtime.sendMessage({
+        action: "activateSubtitleTranslation",
+        videoId,
+        currentTime: getPlayerCurrentTime(),
+        mode,
+      });
+      if (result?.success) {
+        ytdSubtitleGeneration = Number(result.generation) || 0;
+      } else if (result?.error) {
+        showSubtitleToggleError(result.error);
+      }
+    } catch (_error) {
+      showSubtitleToggleError("字幕翻译暂时不可用");
+    }
+    return;
+  }
+
+  // 中 <-> 双: presentation only. No new provider request is made.
+  setPlayerSubtitleMode(mode);
+  chrome.runtime
+    .sendMessage({ action: "setSubtitleDisplayMode", videoId, mode })
+    .catch(() => {});
+}
+
+function showSubtitleToggleError(message) {
+  setPlayerSubtitleMode("off");
+  if (ytdSubtitleToggle) ytdSubtitleToggle.title = String(message || "");
+}
+
+function getPlayerCurrentTime() {
+  const video = document.querySelector("video.html5-main-video");
+  return video && Number.isFinite(video.currentTime) ? video.currentTime : 0;
+}
+
+/**
+ * Asks the background worker to translate the next few phrases as playback
+ * moves forward. Refused outright by the background unless this exact tab and
+ * video are still the ones the user switched on.
+ */
+function requestSubtitlePrefetch() {
+  if (ytdSubtitleMode === "off") return;
+  const videoId = getYouTubeVideoIdFromLocation();
+  if (!videoId) return;
+  const now = Date.now();
+  if (now - ytdSubtitleLastPrefetchAt < 1500) return;
+  ytdSubtitleLastPrefetchAt = now;
+  chrome.runtime
+    .sendMessage({
+      action: "prefetchSubtitleWindow",
+      videoId,
+      currentTime: getPlayerCurrentTime(),
+    })
+    .catch(() => {});
+}
+
+function applySubtitleOverlayTrack(track, generation) {
+  if (!track || track.videoId !== getYouTubeVideoIdFromLocation()) return;
+  // A result from a session the user has already left must never be drawn.
+  if (ytdSubtitleMode === "off") return;
+  if (
+    Number.isFinite(Number(generation)) &&
+    ytdSubtitleGeneration &&
+    Number(generation) < ytdSubtitleGeneration
+  ) {
+    return;
+  }
+  if (Number.isFinite(Number(generation))) ytdSubtitleGeneration = Number(generation);
+
+  const segments = (Array.isArray(track.segments) ? track.segments : []).filter(
+    (segment) =>
+      Number.isFinite(Number(segment?.start)) &&
+      Number.isFinite(Number(segment?.end)) &&
+      Number(segment.end) > Number(segment.start),
+  );
+  ytdSubtitleTrack = { videoId: track.videoId, segments };
+  ensureSubtitleOverlay();
+  updatePlayerSubtitleOverlay();
+}
+
+function clearSubtitleOverlay() {
+  ytdSubtitleOverlay?.remove();
+  ytdSubtitleToggle?.remove();
+  ytdSubtitleOverlay = null;
+  ytdSubtitleToggle = null;
+  ytdSubtitleTrack = null;
+  ytdSubtitleMode = "off";
+  ytdSubtitleVideo = null;
+  ytdSubtitleVideoId = "";
+  ytdSubtitleGeneration = 0;
+  ytdSubtitleLastPrefetchAt = 0;
+}
+
+/**
+ * Puts the subtitle button on the player and makes sure this video starts
+ * closed. The button is shown even before any subtitle track exists, because
+ * fetching one is precisely what the first click is for.
+ */
+function setupPlayerSubtitlesForCurrentVideo() {
+  if (ytdSubtitleRetryTimer) {
+    clearInterval(ytdSubtitleRetryTimer);
+    ytdSubtitleRetryTimer = null;
+  }
+  if (!window.location.pathname.includes("/watch")) {
+    // Left the player entirely (home, search, a channel page). Retire the
+    // authorization rather than leaving a session alive with nothing driving it.
+    const hadOverlay = !!ytdSubtitleOverlay;
+    clearSubtitleOverlay();
+    if (hadOverlay) {
+      chrome.runtime
+        .sendMessage({ action: "resetSubtitleSession" })
+        .catch(() => {});
+    }
+    return;
+  }
+
+  const videoId = getYouTubeVideoIdFromLocation();
+  if (videoId !== ytdSubtitleVideoId) {
+    ytdSubtitleVideoId = videoId;
+    ytdSubtitleTrack = null;
+    ytdSubtitleGeneration = 0;
+    ytdSubtitleMode = "off";
+    // A page load or a video change retires the previous authorization.
+    chrome.runtime
+      .sendMessage({ action: "resetSubtitleSession", videoId })
+      .catch(() => {});
+  }
+
+  let attempts = 0;
+  const attempt = () => {
+    attempts += 1;
+    if (ensureSubtitleOverlay()) {
+      setPlayerSubtitleMode(ytdSubtitleMode);
+      if (ytdSubtitleRetryTimer) {
+        clearInterval(ytdSubtitleRetryTimer);
+        ytdSubtitleRetryTimer = null;
+      }
+      return;
+    }
+    if (attempts >= 30 && ytdSubtitleRetryTimer) {
+      clearInterval(ytdSubtitleRetryTimer);
+      ytdSubtitleRetryTimer = null;
+    }
+  };
+
+  attempt();
+  if (!ytdSubtitleRetryTimer && (!ytdSubtitleOverlay || !ytdSubtitleToggle)) {
+    ytdSubtitleRetryTimer = setInterval(attempt, 300);
+  }
+}
 
 // ============================================================
 // DIGEST BUTTON INJECTION
@@ -378,6 +775,10 @@ function setupButtonObserver() {
       scheduleDigestButtonReconciliation();
       if (!ytdNoteButton || !ytdNoteButton.isConnected) {
         tryInjectNoteButton();
+      }
+      if (ytdSubtitleTrack && (!ytdSubtitleOverlay || !ytdSubtitleOverlay.isConnected)) {
+        ensureSubtitleOverlay();
+        updatePlayerSubtitleOverlay();
       }
     }
   });
@@ -805,6 +1206,7 @@ function escapeHtmlForContent(text) {
  * we clean up old markers and re-inject the button.
  */
 document.addEventListener("yt-navigate-finish", () => {
+  clearSubtitleOverlay();
   // Clean up old key moment markers when navigating to a new video
   const existingMarkers = document.querySelectorAll(".ytd-key-moment-markers");
   existingMarkers.forEach((m) => m.remove());
@@ -839,5 +1241,20 @@ document.addEventListener("yt-navigate-finish", () => {
   setTimeout(() => {
     scheduleDigestButtonReconciliation(0);
     tryInjectNoteButton();
+    setupPlayerSubtitlesForCurrentVideo();
   }, 500);
 });
+
+// Pure helpers exposed only for the repository's Node tests.
+globalThis.__YTD_PLAYER_SUBTITLES_TESTING__ = {
+  normalizePlayerSubtitleMode,
+  findPlayerSubtitleCue,
+  subtitleModeLabel,
+  nextPlayerSubtitleMode,
+  getPlayerSubtitleMode: () => ytdSubtitleMode,
+  setPlayerSubtitleMode,
+  applySubtitleOverlayTrack,
+  handlePlayerSubtitleToggle,
+  setupPlayerSubtitlesForCurrentVideo,
+  clearSubtitleOverlay,
+};

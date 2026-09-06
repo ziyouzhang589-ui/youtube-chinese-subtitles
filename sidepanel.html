@@ -111,6 +111,11 @@
                     aria-label="Translating"
                   ></span>
                 </div>
+                <!-- Translation is started from the player only, so this
+                     control is a status read-out. Say so plainly. -->
+                <p class="transcript-mode-hint" id="transcriptModeHint">
+                  请在视频播放器中开启翻译
+                </p>
               </div>
               <div class="transcript-actions">
                 <button class="enhance-btn" id="copyTranscriptBtn">Copy</button>
@@ -205,6 +210,7 @@
     </button>
 
     <script src="settings.js"></script>
+    <script src="subtitle-units.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

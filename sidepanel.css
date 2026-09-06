@@ -373,6 +373,34 @@ body {
   box-shadow: var(--shadow-sm);
 }
 
+/* All three modes are reading views over text the panel already holds, so none
+   of them costs anything. They are simply unavailable until the player has
+   produced a translation to read. */
+.transcript-mode-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.transcript-mode-btn:disabled:hover {
+  color: var(--text-muted);
+}
+
+/* Shown only while 中文 and 双语 are unavailable: it says where the switch is. */
+.transcript-mode-hint {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font: 500 10.5px/1.4 var(--font-body);
+  transition: color 0.2s ease;
+}
+
+.transcript-mode-hint[hidden] {
+  display: none;
+}
+
+.transcript-mode-hint--nudge {
+  color: var(--accent);
+}
+
 .translation-spinner {
   display: none;
   width: 12px;

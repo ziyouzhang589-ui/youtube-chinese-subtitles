@@ -14,11 +14,21 @@
 // Import safe defaults and validation helpers. Secret keys live in
 // chrome.storage.local and are never part of the extension source.
 importScripts("settings.js");
+// Shared cue segmentation + cache keys. The player, the side panel and this
+// worker must derive identical cue IDs or a paid translation would be lost.
+importScripts("subtitle-units.js");
 
 const DEBUG = false;
 const AI_PROVIDER_IDLE_TIMEOUT_MS = 50_000;
 const AI_PROVIDER_HARD_TIMEOUT_MS = 120_000;
 const AI_PROVIDER_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const SUBTITLE_TRACK_STORAGE_PREFIX = "ytd_subtitle_track_";
+const SUBTITLE_TRACK_MAX_ENTRIES = 20;
+const SUBTITLE_TRACK_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+// Temporary, per-browser-session switches. chrome.storage.session is wiped when
+// the browser fully quits, which is exactly the "default closed again" rule.
+const SIDE_PANEL_SESSION_KEY = "ytd_open_side_panel_tabs";
+const SUBTITLE_SESSION_KEY = "ytd_subtitle_session";
 const debugLog = (...args) => {
   if (DEBUG) console.log(...args);
 };
@@ -34,6 +44,555 @@ chrome.storage.local
 async function getSettings() {
   const stored = await chrome.storage.local.get(YTD_SETTINGS.STORAGE_KEY);
   return YTD_SETTINGS.normalize(stored[YTD_SETTINGS.STORAGE_KEY]);
+}
+
+function normalizeSubtitleOverlayMode(mode) {
+  return YTD_SUBTITLE_UNITS.normalizeSubtitleDisplayMode(mode);
+}
+
+function normalizeSubtitleOverlayTrack(input) {
+  const videoId = typeof input?.videoId === "string" ? input.videoId.trim() : "";
+  if (!/^[A-Za-z0-9_-]{6,128}$/.test(videoId)) return null;
+
+  const segments = Array.isArray(input?.segments) ? input.segments : [];
+  if (segments.length > 2_000) return null;
+
+  const normalizedSegments = segments
+    .map((segment) => {
+      const start = Number(segment?.start);
+      const candidateEnd = Number(segment?.end);
+      return {
+        id: typeof segment?.id === "string" ? segment.id.slice(0, 128) : "",
+        start,
+        // Older stored tracks have no explicit end and remain readable. New
+        // player tracks use it so a subtitle disappears during source gaps.
+        end:
+          Number.isFinite(candidateEnd) && candidateEnd > start
+            ? candidateEnd
+            : undefined,
+        original: typeof segment?.original === "string" ? segment.original.trim() : "",
+        translated:
+          typeof segment?.translated === "string" ? segment.translated.trim() : "",
+      };
+    })
+    .filter(
+      (segment) =>
+        segment.id &&
+        Number.isFinite(segment.start) &&
+        segment.start >= 0 &&
+        segment.original &&
+        segment.original.length <= 4_000 &&
+        segment.translated.length <= 4_000,
+    );
+
+  // A stored track deliberately carries no display mode. "Should Chinese be
+  // showing right now" is a temporary, user-granted intent — persisting it is
+  // what used to make a reopened video translate itself automatically.
+  return {
+    videoId,
+    mode: "off",
+    segments: normalizedSegments,
+    timestamp: Date.now(),
+  };
+}
+
+function subtitleOverlayStorageKey(videoId) {
+  return `${SUBTITLE_TRACK_STORAGE_PREFIX}${videoId}`;
+}
+
+async function evictSubtitleOverlayTracks() {
+  const allData = await chrome.storage.local.get(null);
+  let entries = Object.entries(allData)
+    .filter(([key]) => key.startsWith(SUBTITLE_TRACK_STORAGE_PREFIX))
+    .map(([key, value]) => ({ key, timestamp: Number(value?.timestamp) || 0 }));
+  const expired = entries
+    .filter((entry) => Date.now() - entry.timestamp > SUBTITLE_TRACK_MAX_AGE_MS)
+    .map((entry) => entry.key);
+  if (expired.length) await chrome.storage.local.remove(expired);
+
+  entries = entries.filter((entry) => !expired.includes(entry.key));
+  if (entries.length <= SUBTITLE_TRACK_MAX_ENTRIES) return;
+  const excess = entries
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(0, entries.length - SUBTITLE_TRACK_MAX_ENTRIES)
+    .map((entry) => entry.key);
+  if (excess.length) await chrome.storage.local.remove(excess);
+}
+
+async function saveSubtitleOverlayTrack(input) {
+  const track = normalizeSubtitleOverlayTrack(input);
+  if (!track) throw new Error("Invalid subtitle overlay track");
+  await chrome.storage.local.set({ [subtitleOverlayStorageKey(track.videoId)]: track });
+  await evictSubtitleOverlayTracks();
+  return track;
+}
+
+async function getSubtitleOverlayTrack(videoId) {
+  const key = subtitleOverlayStorageKey(videoId);
+  const result = await chrome.storage.local.get(key);
+  const track = result[key];
+  if (!track) return null;
+  if (Date.now() - (Number(track.timestamp) || 0) > SUBTITLE_TRACK_MAX_AGE_MS) {
+    await chrome.storage.local.remove(key);
+    return null;
+  }
+  return normalizeSubtitleOverlayTrack(track);
+}
+
+// ============================================================
+// PLAYER SUBTITLE SESSION
+// ============================================================
+//
+// A "session" is one video, in one tab, that the user explicitly switched
+// subtitles on for. Nothing here starts on its own: the only entry point is
+// activateSubtitleTranslation(), sent when the player toggle moves 关 -> 中.
+//
+// The session lives in chrome.storage.session, so it disappears when the
+// browser quits and can never resurrect a translation after a restart. Its
+// `generation` counter invalidates in-flight work the moment the user closes
+// subtitles or moves to another video.
+
+let subtitleSession = null;
+let subtitleGenerationCounter = 0;
+
+const subtitleSessionReady = (async () => {
+  try {
+    const stored = await chrome.storage.session.get(SUBTITLE_SESSION_KEY);
+    const value = stored?.[SUBTITLE_SESSION_KEY];
+    if (value && typeof value === "object" && value.activatedByUser) {
+      subtitleSession = value;
+      subtitleGenerationCounter = Number(value.generation) || 0;
+    }
+  } catch (_error) {
+    // A service worker without session storage simply starts with no session.
+  }
+})();
+
+function persistSubtitleSession() {
+  const payload = subtitleSession ? { [SUBTITLE_SESSION_KEY]: subtitleSession } : null;
+  if (payload) {
+    chrome.storage.session.set(payload).catch(() => {});
+  } else {
+    chrome.storage.session.remove(SUBTITLE_SESSION_KEY).catch(() => {});
+  }
+}
+
+function subtitleSessionSnapshot() {
+  return subtitleSession
+    ? {
+        tabId: subtitleSession.tabId,
+        videoId: subtitleSession.videoId,
+        mode: subtitleSession.mode,
+        generation: subtitleSession.generation,
+        activatedByUser: subtitleSession.activatedByUser,
+      }
+    : null;
+}
+
+function isValidVideoId(videoId) {
+  return typeof videoId === "string" && /^[A-Za-z0-9_-]{6,20}$/.test(videoId);
+}
+
+/**
+ * True only when this exact tab + video is the one the user switched on and
+ * subtitles are still showing. Every provider call is gated on this.
+ */
+function subtitleSessionMatches(tabId, videoId, generation) {
+  if (!subtitleSession?.activatedByUser) return false;
+  if (subtitleSession.mode === "off") return false;
+  if (Number.isInteger(tabId) && subtitleSession.tabId !== tabId) return false;
+  if (videoId && subtitleSession.videoId !== videoId) return false;
+  if (Number.isInteger(generation) && subtitleSession.generation !== generation) {
+    return false;
+  }
+  return true;
+}
+
+function startSubtitleSession(tabId, videoId, mode) {
+  subtitleGenerationCounter += 1;
+  subtitleSession = {
+    tabId,
+    videoId,
+    mode: normalizeSubtitleOverlayMode(mode) === "bilingual" ? "bilingual" : "zh",
+    generation: subtitleGenerationCounter,
+    activatedByUser: true,
+  };
+  persistSubtitleSession();
+  return subtitleSession;
+}
+
+/**
+ * Ends the current session. Bumping the generation is what cancels queued work
+ * and stops late provider responses from reaching a player that moved on.
+ */
+function endSubtitleSession() {
+  subtitleGenerationCounter += 1;
+  subtitleSession = null;
+  persistSubtitleSession();
+  subtitleQueue.pending = [];
+  subtitleQueue.queued.clear();
+}
+
+// ============================================================
+// PLAYER SUBTITLE TRANSLATION QUEUE
+// ============================================================
+//
+// This used to live in the side panel, which meant closing the panel silently
+// killed the player's subtitles. It now runs here so the player works with the
+// panel closed — and so the DeepSeek key never has to leave the worker.
+
+let subtitleWorkspace = null; // { videoId, cues, translations: Map, videoTitle }
+
+const subtitleQueue = {
+  pending: [],
+  queued: new Set(),
+  inFlight: new Set(),
+  processing: false,
+};
+
+function digestCacheKey(videoId) {
+  return `digest_${videoId}`;
+}
+
+async function readDigestCache(videoId) {
+  const key = digestCacheKey(videoId);
+  const stored = await chrome.storage.local.get(key);
+  const cached = stored?.[key];
+  return cached && typeof cached === "object" ? cached : null;
+}
+
+/**
+ * Writes back only the fields we own. Notes, the AI overview, and paragraph
+ * translations already in the entry are carried through untouched.
+ */
+async function mergeDigestCache(videoId, patch) {
+  const key = digestCacheKey(videoId);
+  const existing = (await readDigestCache(videoId)) || {};
+  await chrome.storage.local.set({
+    [key]: { ...existing, ...patch, timestamp: Date.now() },
+  });
+}
+
+/**
+ * Builds (or reuses) the cue list and translation cache for one video.
+ * Supadata is called only when no cached transcript exists.
+ */
+async function loadSubtitleWorkspace(videoId) {
+  if (subtitleWorkspace?.videoId === videoId) return subtitleWorkspace;
+
+  const cached = await readDigestCache(videoId);
+  let transcript = Array.isArray(cached?.transcript) ? cached.transcript : null;
+  let videoTitle = typeof cached?.videoTitle === "string" ? cached.videoTitle : "";
+
+  if (!transcript?.length) {
+    const fetched = await handleFetchTranscript(videoId);
+    if (!fetched?.success) {
+      throw new Error(fetched?.message || fetched?.error || "No transcript available");
+    }
+    transcript = fetched.transcript;
+    // Merge, never replace: an existing overview or note set must survive.
+    await mergeDigestCache(videoId, {
+      transcript: fetched.transcript,
+      transcriptText: fetched.transcriptText,
+      transcriptTimestamped: fetched.transcriptTextTimestamped,
+      transcriptLanguage: fetched.language || null,
+    });
+  }
+
+  const cues = YTD_SUBTITLE_UNITS.buildPlayerSubtitleCues(transcript);
+  const translations = new Map();
+
+  // Seed from the compact subtitle cache...
+  const storedTrack = await getSubtitleOverlayTrack(videoId);
+  storedTrack?.segments?.forEach((segment) => {
+    if (segment.translated) translations.set(segment.id, segment.translated);
+  });
+  // ...and from the side panel's cue cache, so translations bought by an
+  // earlier version are reused instead of being paid for twice.
+  const legacyCache = cached?.playerCueCache;
+  if (legacyCache && typeof legacyCache === "object") {
+    cues.forEach((cue) => {
+      if (translations.has(cue.id)) return;
+      const value = legacyCache[YTD_SUBTITLE_UNITS.playerSubtitleCueCacheKey(videoId, cue)];
+      if (typeof value === "string" && value.trim()) translations.set(cue.id, value.trim());
+    });
+  }
+
+  subtitleWorkspace = { videoId, cues, translations, videoTitle };
+  return subtitleWorkspace;
+}
+
+function buildSubtitleTrack(workspace) {
+  return {
+    videoId: workspace.videoId,
+    mode: "off",
+    segments: workspace.cues.map((cue) => ({
+      id: cue.id,
+      start: cue.start,
+      end: cue.end,
+      original: cue.text,
+      translated: workspace.translations.get(cue.id) || "",
+    })),
+  };
+}
+
+/**
+ * Persists translated cues in both caches the extension already reads: the
+ * compact subtitle track (used by the player) and the side panel's cue cache.
+ */
+async function persistSubtitleTranslations(workspace) {
+  const translatedSegments = workspace.cues
+    .filter((cue) => workspace.translations.get(cue.id))
+    .map((cue) => ({
+      id: cue.id,
+      start: cue.start,
+      end: cue.end,
+      original: cue.text,
+      translated: workspace.translations.get(cue.id),
+    }));
+  if (!translatedSegments.length) return;
+
+  await saveSubtitleOverlayTrack({
+    videoId: workspace.videoId,
+    segments: translatedSegments,
+  }).catch(() => {});
+
+  const cached = await readDigestCache(workspace.videoId);
+  if (!cached) return;
+  const playerCueCache = { ...(cached.playerCueCache || {}) };
+  translatedSegments.forEach((segment) => {
+    playerCueCache[
+      YTD_SUBTITLE_UNITS.playerSubtitleCueCacheKey(workspace.videoId, segment)
+    ] = segment.translated;
+  });
+  await mergeDigestCache(workspace.videoId, { playerCueCache });
+}
+
+async function pushSubtitleTrack(workspace, generation) {
+  if (!subtitleSessionMatches(null, workspace.videoId, generation)) return;
+  const track = buildSubtitleTrack(workspace);
+  const tabId = subtitleSession.tabId;
+  await chrome.tabs
+    .sendMessage(tabId, {
+      action: "setSubtitleOverlayTrack",
+      track,
+      generation,
+    })
+    .catch(() => {});
+  // The side panel mirrors whatever the player already paid for. It is a
+  // passive listener: if it is closed, nothing here changes.
+  chrome.runtime
+    .sendMessage({
+      action: "subtitleTrackUpdated",
+      videoId: workspace.videoId,
+      generation,
+      mode: subtitleSession.mode,
+      track,
+    })
+    .catch(() => {});
+}
+
+function enqueueSubtitleCue(index, workspace, generation) {
+  const cue = workspace.cues[index];
+  if (!cue) return;
+  // Three states, one check: already paid for, already waiting, already sent.
+  if (workspace.translations.has(cue.id)) return;
+  if (subtitleQueue.queued.has(cue.id) || subtitleQueue.inFlight.has(cue.id)) return;
+  subtitleQueue.pending.push({ index, generation, videoId: workspace.videoId });
+  subtitleQueue.queued.add(cue.id);
+}
+
+/**
+ * Queues the phrase being spoken plus a short look-ahead. This is the only
+ * place new provider work is created, and it runs solely for an active session.
+ */
+function enqueueSubtitleWindow(workspace, currentTime, generation) {
+  const startIndex = YTD_SUBTITLE_UNITS.findPlaybackCueIndex(workspace.cues, currentTime);
+  const end = Math.min(
+    workspace.cues.length,
+    startIndex + 1 + YTD_SUBTITLE_UNITS.SUBTITLE_PREFETCH_LOOKAHEAD,
+  );
+  for (let index = startIndex; index < end; index += 1) {
+    enqueueSubtitleCue(index, workspace, generation);
+  }
+  processSubtitleQueue().catch((error) =>
+    debugLog("[YouTube Digest BG] Subtitle queue stopped:", error?.message),
+  );
+}
+
+async function processSubtitleQueue() {
+  if (subtitleQueue.processing) return;
+  subtitleQueue.processing = true;
+  try {
+    while (subtitleQueue.pending.length) {
+      // Read the workspace fresh every batch. A video change swaps it, and any
+      // queue entry left over from the old one is dropped by the checks below.
+      const workspace = subtitleWorkspace;
+      const batch = [];
+      while (
+        workspace &&
+        batch.length < YTD_SUBTITLE_UNITS.SUBTITLE_BATCH_SIZE &&
+        subtitleQueue.pending.length
+      ) {
+        const item = subtitleQueue.pending.shift();
+        if (item.videoId !== workspace.videoId) continue;
+        const cue = workspace.cues[item.index];
+        if (!cue) continue;
+        subtitleQueue.queued.delete(cue.id);
+        // The user may have closed subtitles or moved on while this waited.
+        if (!subtitleSessionMatches(null, workspace.videoId, item.generation)) continue;
+        // Last-chance cache check: a concurrent batch may have just filled it.
+        if (workspace.translations.has(cue.id)) continue;
+        subtitleQueue.inFlight.add(cue.id);
+        batch.push({ cue, generation: item.generation });
+      }
+      if (!batch.length) {
+        if (!workspace) subtitleQueue.pending = [];
+        continue;
+      }
+
+      const generation = batch[0].generation;
+      try {
+        const result = await handleTranslateContent(
+          { segments: batch.map(({ cue }) => ({ id: cue.id, text: cue.text })) },
+          "transcriptBatch",
+          "zh",
+          workspace.videoTitle,
+        );
+        if (result?.success) {
+          (result.translatedContent?.segments || []).forEach((segment) => {
+            if (segment?.id && segment.text) {
+              // A late response still belongs to THIS video, so the cache keeps
+              // it — only the push below is gated on the session still living.
+              workspace.translations.set(segment.id, segment.text);
+            }
+          });
+          await persistSubtitleTranslations(workspace);
+          await pushSubtitleTrack(workspace, generation);
+        }
+      } catch (error) {
+        debugLog("[YouTube Digest BG] Subtitle translation batch failed:", error?.message);
+      } finally {
+        batch.forEach(({ cue }) => subtitleQueue.inFlight.delete(cue.id));
+      }
+    }
+  } finally {
+    subtitleQueue.processing = false;
+  }
+}
+
+/**
+ * Handles 关 -> 中 in the player: the one action that authorizes DeepSeek use
+ * for this video. Everything else can only reuse what this produced.
+ */
+async function handleActivateSubtitleTranslation(tabId, videoId, currentTime, mode) {
+  await subtitleSessionReady;
+  if (!Number.isInteger(tabId)) throw new Error("Missing tab context");
+  if (!isValidVideoId(videoId)) throw new Error("Invalid video ID");
+
+  const session = startSubtitleSession(tabId, videoId, mode);
+  subtitleQueue.pending = [];
+  subtitleQueue.queued.clear();
+
+  let workspace;
+  try {
+    workspace = await loadSubtitleWorkspace(videoId);
+  } catch (error) {
+    // No subtitles to work with. Drop the authorization so playback does not
+    // keep retrying Supadata behind the user's back.
+    if (subtitleSessionMatches(tabId, videoId, session.generation)) endSubtitleSession();
+    throw error;
+  }
+  if (!subtitleSessionMatches(tabId, videoId, session.generation)) {
+    return { success: true, generation: session.generation, mode: session.mode };
+  }
+
+  // Show whatever is already cached before any network work starts.
+  await pushSubtitleTrack(workspace, session.generation);
+  enqueueSubtitleWindow(workspace, currentTime, session.generation);
+  return { success: true, generation: session.generation, mode: session.mode };
+}
+
+async function handlePrefetchSubtitleWindow(tabId, videoId, currentTime) {
+  await subtitleSessionReady;
+  if (!subtitleSessionMatches(tabId, videoId)) {
+    return { success: false, error: "Subtitle translation is not active" };
+  }
+  const generation = subtitleSession.generation;
+  const workspace = await loadSubtitleWorkspace(videoId);
+  if (!subtitleSessionMatches(tabId, videoId, generation)) {
+    return { success: false, error: "Subtitle session changed" };
+  }
+  enqueueSubtitleWindow(workspace, currentTime, generation);
+  return { success: true, generation };
+}
+
+/**
+ * 中 <-> 双 only changes how an already-translated cue is drawn. No cue is
+ * re-sent to the provider, because both texts are already in the track.
+ */
+async function handleSetSubtitleDisplayMode(tabId, videoId, mode) {
+  await subtitleSessionReady;
+  const normalized = normalizeSubtitleOverlayMode(mode);
+  if (normalized === "off") return handleDeactivateSubtitleTranslation(tabId, videoId);
+  if (!subtitleSessionMatches(tabId, videoId)) {
+    return { success: false, error: "Subtitle translation is not active" };
+  }
+  subtitleSession.mode = normalized;
+  persistSubtitleSession();
+  chrome.runtime
+    .sendMessage({
+      action: "subtitleSessionChanged",
+      videoId,
+      mode: normalized,
+      generation: subtitleSession.generation,
+    })
+    .catch(() => {});
+  return { success: true, mode: normalized };
+}
+
+async function handleDeactivateSubtitleTranslation(tabId, videoId) {
+  await subtitleSessionReady;
+  const wasActive = subtitleSessionMatches(tabId, videoId);
+  if (wasActive || subtitleSession?.tabId === tabId) endSubtitleSession();
+  chrome.runtime
+    .sendMessage({ action: "subtitleSessionChanged", videoId, mode: "off" })
+    .catch(() => {});
+  return { success: true, mode: "off" };
+}
+
+/**
+ * Page reload, video change, or SPA navigation. The old video's authorization
+ * never carries over to the new one.
+ */
+async function handleResetSubtitleSession(tabId) {
+  await subtitleSessionReady;
+  // Only this tab's own session is retired. A video playing with subtitles on
+  // in another tab is none of this page's business.
+  const ownsSession =
+    !Number.isInteger(tabId) || subtitleSession?.tabId === tabId;
+  if (!ownsSession) return { success: true };
+
+  const hadSession = !!subtitleSession;
+  endSubtitleSession();
+  subtitleWorkspace = null;
+  if (hadSession) {
+    chrome.runtime
+      .sendMessage({ action: "subtitleSessionChanged", videoId: "", mode: "off" })
+      .catch(() => {});
+  }
+  return { success: true };
+}
+
+async function handleGetSubtitleSessionState(videoId) {
+  await subtitleSessionReady;
+  const snapshot = subtitleSessionSnapshot();
+  const active = !!snapshot && (!videoId || snapshot.videoId === videoId);
+  return {
+    success: true,
+    session: active ? snapshot : null,
+    mode: active ? snapshot.mode : "off",
+  };
 }
 
 const promptFileCache = new Map();
@@ -229,24 +788,126 @@ async function readBoundedAiResponse(response, onActivity) {
 // SIDE PANEL SETUP
 // ============================================================
 
-/**
- * When the user clicks the extension icon, open the side panel.
- * Chrome's Side Panel API lets us show a persistent panel alongside the page.
- */
-chrome.action.onClicked.addListener((tab) => {
-  // Re-enable + open without awaiting — preserves user gesture context
-  chrome.sidePanel.setOptions({
-    tabId: tab.id,
-    path: "sidepanel.html",
-    enabled: true,
-  });
-  chrome.sidePanel.open({ tabId: tab.id });
-});
+// The side panel is opened by the user and by nobody else. Chrome's built-in
+// "open on action click" behaviour is switched off so this worker owns both
+// halves of the toggle and always knows which state the panel is in.
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: false })
+  .catch(() => {});
+
+const supportsSidePanelClose = typeof chrome.sidePanel?.close === "function";
 
 /**
- * Allow the side panel to open on any page, but it's designed for YouTube.
+ * Which tabs the user has opened the panel for, this browser session.
+ *
+ * Kept in memory so the action click can decide synchronously (awaiting
+ * anything first would spend the user gesture that sidePanel.open() needs),
+ * and mirrored into chrome.storage.session so a restarted service worker does
+ * not forget. Session storage is cleared when Chrome quits, which is exactly
+ * the "panel is closed again after a restart" rule.
  */
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+const openSidePanelTabs = new Set();
+
+const sidePanelStateReady = (async () => {
+  try {
+    const stored = await chrome.storage.session.get(SIDE_PANEL_SESSION_KEY);
+    const ids = stored?.[SIDE_PANEL_SESSION_KEY];
+    if (Array.isArray(ids)) {
+      ids.forEach((id) => {
+        if (Number.isInteger(id)) openSidePanelTabs.add(id);
+      });
+    }
+  } catch (_error) {
+    // No session storage — start from "closed everywhere", the safe default.
+  }
+})();
+
+function persistSidePanelState() {
+  chrome.storage.session
+    .set({ [SIDE_PANEL_SESSION_KEY]: [...openSidePanelTabs] })
+    .catch(() => {});
+}
+
+function markSidePanelOpen(tabId) {
+  if (!Number.isInteger(tabId)) return;
+  if (!openSidePanelTabs.has(tabId)) {
+    openSidePanelTabs.add(tabId);
+    persistSidePanelState();
+  }
+}
+
+function markSidePanelClosed(tabId) {
+  if (!Number.isInteger(tabId)) return;
+  if (openSidePanelTabs.delete(tabId)) persistSidePanelState();
+}
+
+/**
+ * Opens the panel for one tab. setOptions + open are called with no await
+ * between them so the click's user-gesture context survives.
+ */
+function openSidePanelForTab(tabId) {
+  chrome.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true });
+  const opening = Promise.resolve(chrome.sidePanel.open({ tabId }));
+  markSidePanelOpen(tabId);
+  return opening.catch((error) => {
+    markSidePanelClosed(tabId);
+    throw error;
+  });
+}
+
+function closeSidePanelForTab(tabId) {
+  markSidePanelClosed(tabId);
+  if (!supportsSidePanelClose) return Promise.resolve();
+  return Promise.resolve(chrome.sidePanel.close({ tabId })).catch(() => {});
+}
+
+// Toolbar icon: open when closed, close when open. On a Chrome without
+// sidePanel.close() this degrades to "icon opens, native X closes".
+chrome.action.onClicked.addListener((tab) => {
+  const tabId = tab?.id;
+  if (!Number.isInteger(tabId)) return;
+  if (supportsSidePanelClose && openSidePanelTabs.has(tabId)) {
+    closeSidePanelForTab(tabId);
+    return;
+  }
+  openSidePanelForTab(tabId).catch((error) => {
+    console.error("[YouTube Digest BG] Could not open the side panel:", error);
+  });
+});
+
+// Keep our record honest when Chrome opens or closes the panel for us — most
+// importantly when the user clicks the panel's own close button.
+if (typeof chrome.sidePanel?.onOpened?.addListener === "function") {
+  chrome.sidePanel.onOpened.addListener((info) => markSidePanelOpen(info?.tabId));
+}
+if (typeof chrome.sidePanel?.onClosed?.addListener === "function") {
+  chrome.sidePanel.onClosed.addListener((info) => {
+    if (Number.isInteger(info?.tabId)) markSidePanelClosed(info.tabId);
+    else {
+      openSidePanelTabs.clear();
+      persistSidePanelState();
+    }
+  });
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  markSidePanelClosed(tabId);
+  if (subtitleSession?.tabId === tabId) endSubtitleSession();
+});
+
+// A fresh browser session starts with everything off: no panel, no subtitles.
+// This runs on real browser startup only — never on a service-worker wake-up,
+// which must not disturb a panel or a translation the user already switched on.
+chrome.runtime.onStartup.addListener(() => {
+  openSidePanelTabs.clear();
+  subtitleSession = null;
+  subtitleWorkspace = null;
+  subtitleQueue.pending = [];
+  subtitleQueue.queued.clear();
+  chrome.storage.session
+    .remove([SIDE_PANEL_SESSION_KEY, SUBTITLE_SESSION_KEY])
+    .catch(() => {});
+});
 
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   if (reason === "install") chrome.runtime.openOptionsPage();
@@ -269,10 +930,14 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
  */
 function updatePanelForTab(tabId, url) {
   const isYouTube = (url || "").startsWith("https://www.youtube.com");
+  // This decides only whether the panel is AVAILABLE here. It never opens the
+  // panel — opening is always a deliberate user action.
   // setOptions can reject if the tab just closed — ignore that harmlessly.
   chrome.sidePanel
     .setOptions({ tabId, path: "sidepanel.html", enabled: isYouTube })
     .catch(() => {});
+  // Chrome closes a panel it just disabled, so our record has to follow.
+  if (!isYouTube) markSidePanelClosed(tabId);
 }
 
 // A tab navigated to a new URL.
@@ -383,6 +1048,71 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // ----- Player subtitle session -----
+  // sender.tab.id is the authority for which tab a message belongs to. A page
+  // script cannot claim to speak for a different tab by passing its own ID.
+
+  // The single action that authorizes DeepSeek use for a video: the player
+  // toggle moving 关 -> 中.
+  if (message.action === "activateSubtitleTranslation") {
+    handleActivateSubtitleTranslation(
+      sender.tab?.id,
+      message.videoId,
+      message.currentTime,
+      message.mode,
+    )
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "prefetchSubtitleWindow") {
+    handlePrefetchSubtitleWindow(
+      sender.tab?.id,
+      message.videoId,
+      message.currentTime,
+    )
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "setSubtitleDisplayMode") {
+    handleSetSubtitleDisplayMode(sender.tab?.id, message.videoId, message.mode)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "deactivateSubtitleTranslation") {
+    handleDeactivateSubtitleTranslation(sender.tab?.id, message.videoId)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "resetSubtitleSession") {
+    handleResetSubtitleSession(sender.tab?.id)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // Read-only views used by the side panel to mirror the player's state.
+  if (message.action === "getSubtitleSessionState") {
+    handleGetSubtitleSessionState(message.videoId)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "getSubtitleOverlayTrack") {
+    getSubtitleOverlayTrack(message.videoId)
+      .then((track) => sendResponse({ success: true, track }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
   if (message.action === "checkConfig") {
     getSettings()
       .then((settings) =>
@@ -402,23 +1132,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "openSidePanel") {
+    // The in-page Digest button only ever OPENS the panel. Closing it is the
+    // toolbar icon's job (or the panel's own close button).
     const tabId = sender.tab?.id;
     debugLog("[YouTube Digest BG] openSidePanel requested from tab:", tabId);
 
-    // Re-enable the panel (it may have been disabled by auto-close) and open it.
-    // IMPORTANT: we call setOptions + open synchronously (no await between them)
-    // to preserve the user gesture context. Chrome requires sidePanel.open()
-    // to be called within a user gesture — awaiting anything first can expire it.
-    if (tabId) {
-      chrome.sidePanel.setOptions({
-        tabId,
-        path: "sidepanel.html",
-        enabled: true,
-      });
-      chrome.sidePanel
-        .open({ tabId })
+    if (Number.isInteger(tabId)) {
+      openSidePanelForTab(tabId)
         .then(() => {
-          // Broadcast to side panel to start digest (in case it's already open)
+          // Tell the panel to load this video, in case it was already open.
           setTimeout(() => {
             chrome.runtime
               .sendMessage({ action: "startDigestFromButton" })
@@ -427,25 +1149,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         })
         .catch((err) => {
           console.error("[YouTube Digest BG] openSidePanel error:", err);
-        });
-    } else {
-      // Fallback: find the active tab
-      chrome.tabs
-        .query({ active: true, lastFocusedWindow: true })
-        .then((tabs) => {
-          if (tabs[0]) {
-            chrome.sidePanel.setOptions({
-              tabId: tabs[0].id,
-              path: "sidepanel.html",
-              enabled: true,
-            });
-            chrome.sidePanel.open({ tabId: tabs[0].id }).catch((err) => {
-              console.error(
-                "[YouTube Digest BG] openSidePanel fallback error:",
-                err,
-              );
-            });
-          }
         });
     }
 
@@ -1635,4 +2338,16 @@ globalThis.__YTD_TRANSLATION_TESTING__ = {
   validateTranscriptBatchRequest,
   normalizeTranslatedSegmentBatch,
   handleTranslateContent,
+  normalizeSubtitleOverlayMode,
+  normalizeSubtitleOverlayTrack,
+  subtitleOverlayStorageKey,
+  subtitleSessionMatches,
+  subtitleSessionSnapshot,
+  startSubtitleSession,
+  endSubtitleSession,
+  buildSubtitleTrack,
+  getSubtitleSession: () => subtitleSession,
+  getOpenSidePanelTabs: () => [...openSidePanelTabs],
+  markSidePanelOpen,
+  markSidePanelClosed,
 };

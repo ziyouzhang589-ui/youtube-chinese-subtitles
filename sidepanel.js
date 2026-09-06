@@ -33,53 +33,20 @@ let errorAction = null;
 // The public transcript control intentionally supports only the original
 // subtitles, Chinese, and an aligned source + Chinese view.
 let currentTranscriptMode = "original";
-let translationGeneration = 0; // Invalidates responses from older UI modes/videos.
-let translationWorkCount = 0;
-let transcriptScrollObserver = null;
-// Stable keys include the video, source mode, language, and semantic segment ID.
+// Which layout the transcript list is currently drawn in. Lets an incoming
+// translation batch patch rows in place instead of rebuilding the list.
+let renderedTranscriptMode = "original";
+// Set when the reader picks a view in the panel, so a later player update does
+// not yank them back. Cleared for every new video.
+let transcriptModePinnedByUser = false;
+// Older versions translated readable side-panel paragraphs separately. Keep
+// that cache only as a migration fallback so already-paid translations remain
+// useful; all new translation work uses the timestamp-accurate player cues.
 let transcriptParagraphCache = new Map();
-const TRANSLATION_MESSAGE_TIMEOUT_MS = 130_000;
-
-/**
- * Prevent a stopped service worker or dead message channel from leaving the
- * transcript queue stuck forever. The underlying Chrome message cannot be
- * cancelled, so settled guards deliberately ignore any late response.
- */
-function sendTranslationMessage(message) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let timeoutId;
-    const finish = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutId);
-      callback(value);
-    };
-
-    timeoutId = setTimeout(() => {
-      finish(
-        reject,
-        new Error(
-          "Translation request timed out after 130 seconds. Please Retry.",
-        ),
-      );
-    }, TRANSLATION_MESSAGE_TIMEOUT_MS);
-
-    let messagePromise;
-    try {
-      messagePromise = chrome.runtime.sendMessage(message);
-    } catch (error) {
-      finish(reject, error);
-      return;
-    }
-
-    Promise.resolve(messagePromise).then(
-      (result) => finish(resolve, result),
-      (error) => finish(reject, error),
-    );
-  });
-}
-
+// Player cues use shorter, timestamp-accurate units than the readable side-panel
+// paragraphs. Keeping their cache separate prevents a paragraph translation from
+// ever being displayed against only part of the source sentence.
+let playerSubtitleCueCache = new Map();
 // --- Auto-scroll state (follow video playback in transcript) ---
 let autoScrollEnabled = true; // True = scroll transcript to follow video playback
 let autoScrollInterval = null; // setInterval ID for polling video time
@@ -96,45 +63,15 @@ const TRANSCRIPT_SEGMENT_LIMITS = Object.freeze({
   maxSeconds: 20,
 });
 
-function normalizeCaptionText(text) {
-  return String(text || "")
-    .replace(/\s+/g, " ")
-    .replace(/([\u3400-\u9fff])\s+([\u3400-\u9fff])/g, "$1$2")
-    .replace(/([，。；：！？])\s+(?=[\u3400-\u9fff])/g, "$1")
-    .replace(/\s+([,.;:!?，。；：！？])/g, "$1")
-    .trim();
-}
-
-/**
- * Splits a single oversized thought at the strongest nearby punctuation.
- * Word boundaries are the final safety valve for captions with no punctuation.
- */
-function splitOversizedThought(text, maxChars) {
-  const parts = [];
-  let rest = normalizeCaptionText(text);
-
-  while (rest.length > maxChars) {
-    const windowText = rest.slice(0, maxChars + 1);
-    const lowerBound = Math.floor(maxChars * 0.55);
-    let cut = -1;
-
-    for (const pattern of [/[;:；：]\s*/g, /[,，]\s*/g, /\s/g]) {
-      pattern.lastIndex = 0;
-      let match;
-      while ((match = pattern.exec(windowText))) {
-        if (match.index >= lowerBound) cut = match.index + match[0].length;
-      }
-      if (cut > 0) break;
-    }
-
-    if (cut <= 0) cut = maxChars;
-    parts.push(rest.slice(0, cut).trim());
-    rest = rest.slice(cut).trim();
-  }
-
-  if (rest) parts.push(rest);
-  return parts;
-}
+// Caption normalization, short-cue segmentation, and cue cache keys are shared
+// with the background worker so both sides derive the exact same cue IDs — a
+// translation paid for by the player is therefore reused here for free.
+const {
+  normalizeCaptionText,
+  splitOversizedThought,
+  buildPlayerSubtitleCues,
+  playerSubtitleCueCacheKey: buildPlayerSubtitleCueCacheKey,
+} = YTD_SUBTITLE_UNITS;
 
 /**
  * Reconstructs complete sentences across raw caption boundaries. Each segment
@@ -266,6 +203,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .getElementById("notesFilterAll")
       ?.classList.contains("active");
     loadNotes(filterAll ? null : currentVideoId);
+    sendResponse({ success: true });
+  }
+  if (message.action === "subtitleSessionChanged") {
+    // The player switched subtitles on, off, or between 中 and 双. Follow it.
+    if (!message.videoId || message.videoId === currentVideoId) {
+      applyTranscriptModeFromPlayer(message.mode);
+      if (message.mode === "off") setTranslatingSpinner(false);
+    }
+    sendResponse({ success: true });
+  }
+  if (message.action === "subtitleTrackUpdated") {
+    handleSubtitleTrackUpdate(message.videoId, message.track, message.mode);
+    setTranslatingSpinner(false);
     sendResponse({ success: true });
   }
   return false;
@@ -534,11 +484,13 @@ async function startDigest(videoId, videoUrl) {
     return;
   }
 
-  // Every video change invalidates observer work and in-flight translations.
+  // A new video always starts from the original transcript. Chinese reappears
+  // only if the player reports that the user switched it on for THIS video.
   if (videoId !== currentVideoId) {
-    translationGeneration += 1;
-    if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
-    transcriptScrollObserver = null;
+    currentTranscriptMode = "original";
+    transcriptModePinnedByUser = false;
+    setTranscriptModeButtons("original");
+    setTranslatingSpinner(false);
   }
 
   // Check cache for this video
@@ -558,6 +510,11 @@ async function startDigest(videoId, videoUrl) {
     if (cached.paragraphCache) {
       for (const [key, value] of Object.entries(cached.paragraphCache)) {
         transcriptParagraphCache.set(key, value);
+      }
+    }
+    if (cached.playerCueCache) {
+      for (const [key, value] of Object.entries(cached.playerCueCache)) {
+        playerSubtitleCueCache.set(key, value);
       }
     }
 
@@ -585,7 +542,8 @@ async function startDigest(videoId, videoUrl) {
 
     // Setup explain feature
     setupExplainFeature();
-    if (currentTranscriptMode !== "original") translateTranscript();
+    // Mirror the player's current subtitle state. Reads cache only.
+    syncSubtitleStateFromPlayer(videoId);
     return;
   }
 
@@ -597,6 +555,7 @@ async function startDigest(videoId, videoUrl) {
   currentTranscriptTimestamped = null;
   currentTranscriptLanguage = null;
   isAnalysisLoading = false;
+  playerSubtitleCueCache = new Map();
 
   if (currentVideoTitle || currentChannelName) {
     const videoInfo = document.getElementById("videoInfo");
@@ -643,7 +602,7 @@ async function startDigest(videoId, videoUrl) {
 
   // Setup explain feature for text selection
   setupExplainFeature();
-  if (currentTranscriptMode !== "original") translateTranscript();
+  syncSubtitleStateFromPlayer(videoId);
 
   // Save transcript to cache (without analysis)
   await saveToCache(videoId);
@@ -826,6 +785,7 @@ function seekFromTranscriptEntryClick(event, seconds) {
 
 function renderTranscript() {
   if (!currentTranscript) return;
+  renderedTranscriptMode = "original";
 
   const transcriptList = document.getElementById("transcriptList");
   transcriptList.innerHTML = "";
@@ -864,6 +824,9 @@ function renderTranscript() {
     );
     transcriptList.appendChild(div);
   });
+
+  // Keep the mode control honest about what this transcript can show.
+  updateTranscriptModeAvailability();
 
   // Start tracking video playback for auto-scroll
   startPlaybackTracking();
@@ -1342,11 +1305,18 @@ async function saveToCache(videoId) {
   if (!videoId || !currentTranscript) return;
 
   try {
-    // Persist semantic-segment translations for this video.
+    // Persist both readable paragraph translations and short player-cue
+    // translations. Their keys intentionally differ because the boundaries do.
     const paragraphCacheForVideo = {};
     for (const [key, value] of transcriptParagraphCache.entries()) {
       if (key.startsWith(`${videoId}:`)) {
         paragraphCacheForVideo[key] = value;
+      }
+    }
+    const playerCueCacheForVideo = {};
+    for (const [key, value] of playerSubtitleCueCache.entries()) {
+      if (key.startsWith(`${videoId}:`)) {
+        playerCueCacheForVideo[key] = value;
       }
     }
 
@@ -1359,6 +1329,7 @@ async function saveToCache(videoId) {
       videoTitle: currentVideoTitle,
       channelName: currentChannelName,
       paragraphCache: paragraphCacheForVideo,
+      playerCueCache: playerCueCacheForVideo,
       timestamp: Date.now(),
     };
 
@@ -1648,8 +1619,9 @@ async function playbackTrackingTick() {
 
     if (!result.success || !result.response) return;
 
-    const currentTime = result.response.currentTime || 0;
-    highlightActiveEntry(currentTime);
+    // Auto-scroll only. Following playback never queues translation work —
+    // the player owns that, and only after the user switched subtitles on.
+    highlightActiveEntry(result.response.currentTime || 0);
   } catch (error) {
     // Silently ignore — YouTube tab might be closed or navigated away
   }
@@ -1752,6 +1724,98 @@ function transcriptTranslationCacheKey(segment) {
   return `${currentVideoId}:zh:semantic:${segment.id}`;
 }
 
+function playerSubtitleCueCacheKey(cue) {
+  return buildPlayerSubtitleCueCacheKey(currentVideoId, cue);
+}
+
+/**
+ * Maps one readable side-panel paragraph to the short, timestamp-accurate
+ * player cues that cover the same time window. Both views can therefore reuse
+ * one translation without changing the side panel's paragraph layout.
+ */
+function getCueIndicesForTranscriptSegment(segments, segmentIndex, cues) {
+  if (
+    !Array.isArray(segments) ||
+    !Array.isArray(cues) ||
+    !Number.isInteger(segmentIndex) ||
+    !segments[segmentIndex]
+  ) {
+    return [];
+  }
+
+  const start = Number(segments[segmentIndex].start) || 0;
+  const nextStart = Number(segments[segmentIndex + 1]?.start);
+  const end = Number.isFinite(nextStart) && nextStart > start
+    ? nextStart
+    : Number.POSITIVE_INFINITY;
+
+  const indices = [];
+  cues.forEach((cue, cueIndex) => {
+    const cueStart = Number(cue?.start);
+    if (!Number.isFinite(cueStart)) return;
+    if (cueStart >= start && cueStart < end) indices.push(cueIndex);
+  });
+  return indices;
+}
+
+function composeTranscriptTranslationFromCues(
+  segments,
+  segmentIndex,
+  cues,
+  getTranslation,
+) {
+  const cueIndices = getCueIndicesForTranscriptSegment(
+    segments,
+    segmentIndex,
+    cues,
+  );
+  if (!cueIndices.length) return { cueIndices, text: "", complete: false };
+
+  const translatedParts = cueIndices.map((cueIndex) =>
+    String(getTranslation(cues[cueIndex]) || "").trim(),
+  );
+  const complete = translatedParts.every(Boolean);
+  return {
+    cueIndices,
+    text: complete ? normalizeCaptionText(translatedParts.join(" ")) : "",
+    complete,
+  };
+}
+
+function getReusedTranscriptTranslation(segments, segmentIndex, cues) {
+  const composed = composeTranscriptTranslationFromCues(
+    segments,
+    segmentIndex,
+    cues,
+    (cue) => playerSubtitleCueCache.get(playerSubtitleCueCacheKey(cue)),
+  );
+  if (composed.complete) return composed.text;
+
+  // Preserve a translation purchased by an older extension version while the
+  // shared short-cue cache is being filled. No new paragraph request is made.
+  const legacy = transcriptParagraphCache.get(
+    transcriptTranslationCacheKey(segments[segmentIndex]),
+  );
+  return legacy || "";
+}
+
+let activePlayerSubtitleCueMemo = { transcript: null, cues: [] };
+
+function getActivePlayerSubtitleCues() {
+  const transcript = currentTranscript || [];
+  if (activePlayerSubtitleCueMemo.transcript !== transcript) {
+    activePlayerSubtitleCueMemo = {
+      transcript,
+      cues: buildPlayerSubtitleCues(transcript),
+    };
+  }
+  return activePlayerSubtitleCueMemo.cues;
+}
+
+function transcriptModeForSubtitleOverlayMode(mode) {
+  return mode === "zh" || mode === "bilingual" ? mode : "original";
+}
+
 function setTranscriptModeButtons(mode) {
   document.querySelectorAll(".transcript-mode-btn").forEach((button) => {
     const active = button.dataset.transcriptMode === mode;
@@ -1760,24 +1824,147 @@ function setTranscriptModeButtons(mode) {
   });
 }
 
-async function handleTranscriptModeChange(mode) {
+/**
+ * How much of this video the player has already had translated. Reading is the
+ * only thing this control can do, so it is offered exactly when there is
+ * something to read.
+ */
+function hasCachedTranscriptTranslation() {
+  if (!currentVideoId || !currentTranscript) return false;
+  return getActivePlayerSubtitleCues().some((cue) =>
+    playerSubtitleCueCache.get(playerSubtitleCueCacheKey(cue)),
+  );
+}
+
+/**
+ * Enables 中文 / 双语 once cached Chinese exists, and keeps the hint visible
+ * only while they are unavailable.
+ */
+function updateTranscriptModeAvailability() {
+  const available = hasCachedTranscriptTranslation();
+  document.querySelectorAll(".transcript-mode-btn").forEach((button) => {
+    const needsTranslation = button.dataset.transcriptMode !== "original";
+    button.disabled = needsTranslation && !available;
+  });
+  const hint = document.getElementById("transcriptModeHint");
+  if (hint) hint.hidden = available;
+}
+
+/**
+ * Switches which view of this transcript the panel shows.
+ *
+ * All three modes are reading views over subtitles and translations the panel
+ * already holds, so none of them calls a provider. Translation itself is still
+ * started in one place only: the subtitle button on the video player. Until
+ * that has produced something, 中文 and 双语 stay disabled and the hint points
+ * at the player.
+ */
+function handleTranscriptModeChange(mode) {
   if (!["original", "zh", "bilingual"].includes(mode)) return;
-  if (mode === currentTranscriptMode) return;
+  if (mode !== "original" && !hasCachedTranscriptTranslation()) {
+    const hint = document.getElementById("transcriptModeHint");
+    if (!hint) return;
+    hint.classList.add("transcript-mode-hint--nudge");
+    setTimeout(() => hint.classList.remove("transcript-mode-hint--nudge"), 1200);
+    return;
+  }
+  // A deliberate choice outranks the player until this video is left.
+  transcriptModePinnedByUser = true;
+  renderTranscriptInMode(mode);
+}
 
-  currentTranscriptMode = mode;
-  translationGeneration += 1;
-  translationWorkCount = 0;
-  setTranslatingSpinner(false);
-  if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
-  transcriptScrollObserver = null;
-  setTranscriptModeButtons(mode);
+/**
+ * Draws the transcript in one mode. Renders from cache only — no request of
+ * any kind is issued from this function or anything it calls.
+ */
+function renderTranscriptInMode(mode) {
+  const transcriptMode = transcriptModeForSubtitleOverlayMode(mode);
+  currentTranscriptMode = transcriptMode;
+  setTranscriptModeButtons(transcriptMode);
+  updateTranscriptModeAvailability();
+  if (!currentTranscript) return;
 
-  if (mode === "original") {
-    renderTranscript();
+  if (transcriptMode === "original") {
+    if (renderedTranscriptMode !== "original") renderTranscript();
     return;
   }
 
-  await translateTranscript();
+  const segments = getActiveTranscriptSegments();
+  const playerCues = getActivePlayerSubtitleCues();
+  if (renderedTranscriptMode !== transcriptMode) {
+    renderTranscriptModeRows(segments, transcriptMode, playerCues);
+  } else {
+    // Patch the rows in place so a batch arriving mid-read does not throw the
+    // user back to the top of the transcript.
+    refreshReusedTranscriptRows(segments, playerCues);
+  }
+}
+
+/**
+ * Follows the player's subtitle button, which sets the default view for a
+ * video. Once the reader has picked a view themselves, their choice holds and
+ * incoming batches only refresh the rows underneath it.
+ */
+function applyTranscriptModeFromPlayer(mode) {
+  renderTranscriptInMode(
+    transcriptModePinnedByUser ? currentTranscriptMode : mode,
+  );
+}
+
+/**
+ * Loads whatever the player has already paid for: the current session's mode
+ * and the cached Chinese cues for this video. Both reads are local.
+ */
+async function syncSubtitleStateFromPlayer(videoId) {
+  if (!videoId) return;
+  try {
+    const cached = await chrome.runtime.sendMessage({
+      action: "getSubtitleOverlayTrack",
+      videoId,
+    });
+    (cached?.track?.segments || []).forEach((segment) => {
+      if (segment?.id && segment.translated) {
+        playerSubtitleCueCache.set(
+          buildPlayerSubtitleCueCacheKey(videoId, segment),
+          segment.translated,
+        );
+      }
+    });
+  } catch (_error) {
+    // No cached track yet — the panel simply shows the original transcript.
+  }
+
+  let mode = "off";
+  try {
+    const state = await chrome.runtime.sendMessage({
+      action: "getSubtitleSessionState",
+      videoId,
+    });
+    mode = state?.mode || "off";
+  } catch (_error) {
+    // Treat an unreachable worker as "player subtitles are off".
+  }
+  if (videoId !== currentVideoId) return;
+  applyTranscriptModeFromPlayer(mode);
+}
+
+/**
+ * A translation batch finished in the background. Merge it into the panel's
+ * cache and redraw — this is display work, never a trigger for more work.
+ */
+function handleSubtitleTrackUpdate(videoId, track, mode) {
+  if (!videoId || videoId !== currentVideoId) return;
+  (track?.segments || []).forEach((segment) => {
+    if (segment?.id && segment.translated) {
+      playerSubtitleCueCache.set(
+        buildPlayerSubtitleCueCacheKey(videoId, segment),
+        segment.translated,
+      );
+    }
+  });
+  // renderTranscriptInMode refreshes the control, so the first batch makes
+  // 中文 and 双语 readable even for someone still looking at the original.
+  applyTranscriptModeFromPlayer(mode || currentTranscriptMode);
 }
 
 function renderTranscriptSegmentContent(segment, mode, translated, error) {
@@ -1798,9 +1985,10 @@ function renderTranscriptSegmentContent(segment, mode, translated, error) {
   return `<span class="transcript-copy"><span class="transcript-translation ${translated ? "" : error ? "translation-error" : "translation-pending"}">${translationHtml}</span></span>`;
 }
 
-function renderTranscriptModeRows(segments, mode) {
+function renderTranscriptModeRows(segments, mode, playerCues) {
   const transcriptList = document.getElementById("transcriptList");
   if (!transcriptList) return [];
+  renderedTranscriptMode = mode;
   transcriptList.innerHTML = "";
 
   const existingBadge = document.getElementById("transcriptSourceBadge");
@@ -1819,8 +2007,10 @@ function renderTranscriptModeRows(segments, mode) {
   const rows = [];
   segments.forEach((segment, index) => {
     const div = document.createElement("div");
-    const cached = transcriptParagraphCache.get(
-      transcriptTranslationCacheKey(segment),
+    const cached = getReusedTranscriptTranslation(
+      segments,
+      index,
+      playerCues,
     );
     div.className = `transcript-entry ${cached ? "translated" : "translating"}`;
     div.dataset.seconds = segment.start;
@@ -1845,241 +2035,66 @@ function renderTranscriptModeRows(segments, mode) {
   return rows;
 }
 
-/**
- * Rebuilds a provider response in source order. Unknown IDs are ignored and
- * missing IDs remain explicit errors, never positional guesses.
- */
-function alignTranslatedSegmentBatch(sourceSegments, responseSegments) {
-  const translatedById = new Map();
-  if (Array.isArray(responseSegments)) {
-    responseSegments.forEach((item) => {
-      if (!item || typeof item.id !== "string" || typeof item.text !== "string")
-        return;
-      const text = item.text.trim();
-      if (text && !translatedById.has(item.id)) {
-        translatedById.set(item.id, text);
-      }
-    });
-  }
-
-  return sourceSegments.map((segment) => ({
-    id: segment.id,
-    text: translatedById.get(segment.id) || "",
-    error: translatedById.has(segment.id) ? "" : "Translation unavailable.",
-  }));
-}
-
-function updateTranslatedRow(segment, index, alignedItem, generation) {
-  if (generation !== translationGeneration) return;
-  const row = document.querySelector(
-    `.transcript-entry[data-segment-id="${CSS.escape(segment.id)}"]`,
-  );
-  if (!row) return;
-
-  if (alignedItem.text) {
-    transcriptParagraphCache.set(
-      transcriptTranslationCacheKey(segment),
-      alignedItem.text,
+function refreshReusedTranscriptRows(segments, playerCues) {
+  segments.forEach((segment, index) => {
+    const row = document.querySelector(
+      `.transcript-entry[data-segment-id="${CSS.escape(segment.id)}"]`,
     );
-  }
-
-  const copy = row.querySelector(".transcript-copy");
-  if (copy) {
-    copy.outerHTML = renderTranscriptSegmentContent(
-      segment,
-      currentTranscriptMode,
-      alignedItem.text,
-      alignedItem.error,
+    if (!row) return;
+    const translated = getReusedTranscriptTranslation(
+      segments,
+      index,
+      playerCues,
     );
-  }
-  row.classList.toggle("translated", !!alignedItem.text);
-  row.classList.toggle("translating", false);
-  row.classList.toggle("translation-failed", !alignedItem.text);
-
-  const retry = row.querySelector(".translation-retry-btn");
-  if (retry) {
-    ["mousedown", "mouseup"].forEach((eventName) => {
-      retry.addEventListener(eventName, (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      });
-    });
-    retry.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      retryTranslationSegment(index, generation);
-    });
-  }
-}
-
-let activeTranslationQueue = null;
-
-async function requestTranscriptTranslationBatch(
-  indices,
-  segments,
-  generation,
-  videoId,
-  mode,
-) {
-  const sourceBatch = indices.map((index) => segments[index]);
-  setTranslatingSpinner(true);
-  try {
-    const result = await sendTranslationMessage({
-      action: "translateContent",
-      content: {
-        segments: sourceBatch.map(({ id, text }) => ({ id, text })),
-      },
-      contentType: "transcriptBatch",
-      targetLanguage: "zh",
-      videoTitle: currentVideoTitle,
-    });
-
-    const isStale =
-      generation !== translationGeneration ||
-      videoId !== currentVideoId ||
-      mode !== currentTranscriptMode;
-    if (isStale) return;
-
-    const responseSegments = result?.success
-      ? result.translatedContent?.segments
-      : [];
-    const aligned = alignTranslatedSegmentBatch(sourceBatch, responseSegments);
-    aligned.forEach((item, batchIndex) => {
-      if (!result?.success) {
-        item.error = result?.error || "Translation failed.";
-      }
-      updateTranslatedRow(
-        sourceBatch[batchIndex],
-        indices[batchIndex],
-        item,
-        generation,
-      );
-    });
-    await updateCache();
-  } catch (error) {
-    if (generation !== translationGeneration) return;
-    sourceBatch.forEach((segment, batchIndex) => {
-      updateTranslatedRow(
+    const copy = row.querySelector(".transcript-copy");
+    if (copy) {
+      copy.outerHTML = renderTranscriptSegmentContent(
         segment,
-        indices[batchIndex],
-        { id: segment.id, text: "", error: error.message || "Translation failed." },
-        generation,
+        currentTranscriptMode,
+        translated,
+        "",
       );
-    });
-  } finally {
-    setTranslatingSpinner(false);
-  }
-}
-
-function retryTranslationSegment(index, generation) {
-  if (generation !== translationGeneration || !activeTranslationQueue) return;
-  const row = document.querySelector(
-    `.transcript-entry[data-segment-index="${index}"]`,
-  );
-  if (row) {
-    row.classList.add("translating");
+    }
+    row.classList.toggle("translated", !!translated);
+    row.classList.toggle("translating", !translated);
     row.classList.remove("translation-failed");
-    const translation = row.querySelector(".transcript-translation");
-    if (translation) {
-      translation.className = "transcript-translation translation-pending";
-      translation.textContent = "Retrying…";
-    }
-  }
-  activeTranslationQueue.enqueue(index, true);
-}
-
-/**
- * Renders immediately, translates the first small batch, then observes the
- * remaining rows. Batches are sequential so the provider is never flooded.
- */
-async function translateTranscript() {
-  const segments = getActiveTranscriptSegments();
-  if (!segments.length || currentTranscriptMode === "original") return;
-
-  translationGeneration += 1;
-  const generation = translationGeneration;
-  const videoId = currentVideoId;
-  const mode = currentTranscriptMode;
-  if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
-
-  const rows = renderTranscriptModeRows(segments, mode);
-  const queue = [];
-  const queued = new Set();
-  let processing = false;
-
-  const processNext = async () => {
-    if (processing || queue.length === 0 || generation !== translationGeneration)
-      return;
-    processing = true;
-    const indices = queue.splice(0, 3);
-    indices.forEach((index) => queued.delete(index));
-    try {
-      await requestTranscriptTranslationBatch(
-        indices,
-        segments,
-        generation,
-        videoId,
-        mode,
-      );
-    } finally {
-      processing = false;
-      if (queue.length && generation === translationGeneration) processNext();
-    }
-  };
-
-  const enqueue = (index, force = false) => {
-    if (!Number.isInteger(index) || !segments[index]) return;
-    const cached = transcriptParagraphCache.has(
-      transcriptTranslationCacheKey(segments[index]),
-    );
-    if ((!force && cached) || queued.has(index)) return;
-    queue.push(index);
-    queued.add(index);
-    // Let all entries reported in the same viewport turn collect before the
-    // worker starts, producing one small contextual multi-segment request.
-    Promise.resolve().then(processNext);
-  };
-  activeTranslationQueue = { enqueue };
-
-  transcriptScrollObserver = new IntersectionObserver(
-    (observerEntries) => {
-      observerEntries
-        .filter((entry) => entry.isIntersecting)
-        .sort(
-          (a, b) =>
-            Number(a.target.dataset.segmentIndex) -
-            Number(b.target.dataset.segmentIndex),
-        )
-        .forEach((entry) => enqueue(Number(entry.target.dataset.segmentIndex)));
-    },
-    {
-      root: document.getElementById("contentArea"),
-      rootMargin: "320px 0px",
-      threshold: 0,
-    },
-  );
-
-  rows.forEach((row, index) => {
-    if (!row.classList.contains("translated")) transcriptScrollObserver.observe(row);
-    if (index < 3) enqueue(index);
   });
 }
 
+// The player-cue translation queue used to live here. It now runs in the
+// background worker (see background.js) so the player keeps translating with
+// this panel closed, and so the DeepSeek key never reaches a UI context.
+// Nothing in this file may call a translation provider.
+
 function setTranslatingSpinner(show) {
-  if (show) translationWorkCount += 1;
-  else translationWorkCount = Math.max(0, translationWorkCount - 1);
-  const isTranslating = translationWorkCount > 0;
   const spinner = document.getElementById("langSpinner");
-  if (spinner) spinner.classList.toggle("visible", isTranslating);
+  if (spinner) spinner.classList.toggle("visible", !!show);
 }
 
 // Pure helpers are exposed for the repository's Node tests. The extension does
 // not read this object at runtime.
 globalThis.__YTD_TRANSCRIPT_TESTING__ = {
-  sendTranslationMessage,
+  // Seeds the transcript state that startDigest normally fills in, so the
+  // render path can be exercised without a live tab or a network call.
+  setTranscriptStateForTests({ videoId, transcript, cueTranslations = {} }) {
+    currentVideoId = videoId;
+    currentTranscript = transcript;
+    currentTranscriptLanguage = "en";
+    playerSubtitleCueCache = new Map(Object.entries(cueTranslations));
+  },
+  renderTranscript,
+  renderTranscriptInMode,
+  handleTranscriptModeChange,
+  hasCachedTranscriptTranslation,
   groupTranscriptEntries,
   splitOversizedThought,
-  alignTranslatedSegmentBatch,
   renderSubtitleInlineMarkup,
   renderTranscriptSegmentContent,
+  buildPlayerSubtitleCues,
+  getCueIndicesForTranscriptSegment,
+  composeTranscriptTranslationFromCues,
+  transcriptModeForSubtitleOverlayMode,
+  applyTranscriptModeFromPlayer,
+  handleSubtitleTrackUpdate,
+  getCurrentTranscriptMode: () => currentTranscriptMode,
 };
