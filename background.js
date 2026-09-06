@@ -289,14 +289,9 @@ async function loadSubtitleWorkspace(videoId) {
     if (!fetched?.success) {
       throw new Error(fetched?.message || fetched?.error || "No transcript available");
     }
+    // handleFetchTranscript has already cached this, merging rather than
+    // replacing so an existing overview or note set survives.
     transcript = fetched.transcript;
-    // Merge, never replace: an existing overview or note set must survive.
-    await mergeDigestCache(videoId, {
-      transcript: fetched.transcript,
-      transcriptText: fetched.transcriptText,
-      transcriptTimestamped: fetched.transcriptTextTimestamped,
-      transcriptLanguage: fetched.language || null,
-    });
   }
 
   const cues = YTD_SUBTITLE_UNITS.buildPlayerSubtitleCues(transcript);
@@ -1292,7 +1287,59 @@ async function getPlayerVideoDetails(tabId) {
  * @param {string} videoId - The YouTube video ID (e.g., "dQw4w9WgXcQ")
  * @returns {Object} - { success, transcript, transcriptText, language } or { success: false, error }
  */
+// Requests currently in flight, keyed by video ID. Two independent paths can
+// ask for the same transcript: the side panel opening a video, and the player
+// subtitle button being switched on. Without this, a long video (Supadata
+// answers those asynchronously and we poll for up to a minute) could be
+// fetched twice, spending two credits and producing exactly the kind of
+// back-to-back burst that trips Supadata's rate limit.
+const inFlightTranscriptRequests = new Map();
+
+/**
+ * Returns the transcript for a video, fetching it at most once.
+ *
+ * Serves an already cached transcript without touching the network, and joins
+ * a concurrent caller to the request that is already running.
+ */
 async function handleFetchTranscript(videoId) {
+  const cached = await readDigestCache(videoId);
+  if (Array.isArray(cached?.transcript) && cached.transcript.length) {
+    return {
+      success: true,
+      transcript: cached.transcript,
+      transcriptText: cached.transcriptText || "",
+      transcriptTextTimestamped: cached.transcriptTimestamped || "",
+      language: cached.transcriptLanguage || null,
+      fromCache: true,
+    };
+  }
+
+  const pending = inFlightTranscriptRequests.get(videoId);
+  if (pending) return pending;
+
+  const request = fetchTranscriptFromSupadata(videoId)
+    .then(async (result) => {
+      // Cache here, at the one place that spends the credit, so the next
+      // caller is served locally no matter which path it came from. Merging
+      // keeps any overview, notes, and translations already stored.
+      if (result?.success && result.transcript?.length) {
+        await mergeDigestCache(videoId, {
+          transcript: result.transcript,
+          transcriptText: result.transcriptText,
+          transcriptTimestamped: result.transcriptTextTimestamped,
+          transcriptLanguage: result.language || null,
+        }).catch(() => {});
+      }
+      return result;
+    })
+    .finally(() => {
+      inFlightTranscriptRequests.delete(videoId);
+    });
+  inFlightTranscriptRequests.set(videoId, request);
+  return request;
+}
+
+async function fetchTranscriptFromSupadata(videoId) {
   try {
     const settings = await getSettings();
     if (!settings.supadataApiKey) {
@@ -2333,6 +2380,7 @@ async function callAiTranslation(
 
 // Pure validators are exposed for the repository's Node tests only.
 globalThis.__YTD_TRANSLATION_TESTING__ = {
+  handleFetchTranscript,
   requestAiCompletion,
   callAiTranslation,
   validateTranscriptBatchRequest,

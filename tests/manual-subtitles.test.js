@@ -590,3 +590,67 @@ test("closing the tab ends its subtitle session", async () => {
   assert.equal(bg.helpers.getSubtitleSession(), null);
   assert.deepEqual(openTabs(bg), []);
 });
+
+test("one video is fetched from Supadata at most once", async () => {
+  const bg = loadBackground();
+
+  // The side panel opening a video and the player subtitle button being
+  // switched on are two independent paths to the same transcript. Fired
+  // together, they must still produce a single Supadata request: two would
+  // spend two credits and trip the rate limit with a back-to-back burst.
+  const [panel, player] = await Promise.all([
+    bg.send({ action: "fetchTranscript", videoId: VIDEO }),
+    bg.send(
+      { action: "activateSubtitleTranslation", videoId: VIDEO, currentTime: 0, mode: "zh" },
+      { tab: { id: TAB } },
+    ),
+  ]);
+  await settle(40);
+
+  assert.equal(panel.success, true);
+  assert.equal(player.success, true);
+  assert.equal(bg.calls.supadata, 1, "concurrent callers share one request");
+});
+
+test("an already fetched transcript is served without touching Supadata", async () => {
+  const bg = loadBackground();
+
+  const first = await bg.send({ action: "fetchTranscript", videoId: VIDEO });
+  assert.equal(first.success, true);
+  assert.equal(first.fromCache, undefined);
+  assert.equal(bg.calls.supadata, 1);
+
+  // Reopening the video, and switching subtitles on, both read the cache.
+  const second = await bg.send({ action: "fetchTranscript", videoId: VIDEO });
+  await bg.send(
+    { action: "activateSubtitleTranslation", videoId: VIDEO, currentTime: 0, mode: "zh" },
+    { tab: { id: TAB } },
+  );
+  await settle(40);
+
+  assert.equal(second.success, true);
+  assert.equal(second.fromCache, true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(second.transcript)),
+    JSON.parse(JSON.stringify(first.transcript)),
+  );
+  assert.equal(bg.calls.supadata, 1, "no second credit is ever spent");
+});
+
+test("a failed fetch is shared, not repeated, by concurrent callers", async () => {
+  const bg = loadBackground({ transcript: [] });
+
+  const [a, b] = await Promise.all([
+    bg.send({ action: "fetchTranscript", videoId: VIDEO }),
+    bg.send({ action: "fetchTranscript", videoId: VIDEO }),
+  ]);
+
+  assert.equal(a.success, false);
+  assert.equal(b.success, false);
+  assert.equal(bg.calls.supadata, 1, "a failure must not double the burst");
+
+  // The failure is not cached: a later, deliberate retry does reach Supadata.
+  const retry = await bg.send({ action: "fetchTranscript", videoId: VIDEO });
+  assert.equal(retry.success, false);
+  assert.equal(bg.calls.supadata, 2, "Try Again still retries");
+});
