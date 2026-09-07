@@ -293,3 +293,38 @@ test("a reader's own choice outranks later player updates", () => {
   panel.helpers.applyTranscriptModeFromPlayer("zh");
   assert.equal(panel.activeButton(), "bilingual");
 });
+
+test("opening the panel on a new video spends nothing until asked", () => {
+  const js = read("sidepanel.js");
+
+  // startDigest must stop at the ready state on a cache miss. Reaching the
+  // network from there is what used to spend one Supadata credit per video
+  // merely browsed with this panel open.
+  const startDigest = js.slice(
+    js.indexOf("async function startDigest("),
+    js.indexOf("async function loadTranscriptForCurrentVideo("),
+  );
+  assert.match(startDigest, /showState\("ready"\);\s*\n\s*return;/);
+  assert.doesNotMatch(startDigest, /action: "fetchTranscript"/);
+
+  // The single fetch lives behind the button on that state.
+  assert.match(js, /getElementById\("fetchTranscriptBtn"\)[\s\S]{0,120}loadTranscriptForCurrentVideo/);
+  const fetchCalls = js.match(/action: "fetchTranscript"/g) || [];
+  assert.equal(fetchCalls.length, 1, "one authorized path to Supadata");
+
+  // A failed fetch must retry the fetch, not bounce back to the ready state.
+  assert.match(js, /showError\([\s\S]{0,200}loadTranscriptForCurrentVideo,\s*\)/);
+});
+
+test("a cached video still opens by itself, because that is free", () => {
+  const js = read("sidepanel.js");
+  const startDigest = js.slice(
+    js.indexOf("async function startDigest("),
+    js.indexOf("async function loadTranscriptForCurrentVideo("),
+  );
+  // The cache hit renders and returns before the ready state is ever reached.
+  const cacheHit = startDigest.slice(0, startDigest.indexOf('showState("ready")'));
+  assert.match(cacheHit, /const cached = await loadFromCache\(videoId\)/);
+  assert.match(cacheHit, /renderTranscript\(\)/);
+  assert.match(cacheHit, /showState\("results"\)/);
+});

@@ -48,6 +48,19 @@
         </div>
       </div>
 
+      <!-- READY STATE: nothing has been fetched for this video yet. Getting
+           the transcript spends a Supadata credit, so it waits for a click. -->
+      <div id="readyState" class="welcome-container" style="display: none">
+        <div class="welcome-icon">&#9655;</div>
+        <div class="welcome-title">获取字幕</div>
+        <div class="welcome-desc">
+          还没有获取这个视频的字幕。点击下面的按钮开始，会消耗 1 个 Supadata 额度。
+          <br /><br />
+          只是打开侧边栏、切换视频或做笔记之外的浏览，都不会消耗额度。
+        </div>
+        <button class="error-btn" id="fetchTranscriptBtn">获取字幕</button>
+      </div>
+
       <!-- LOADING STATE -->
       <div id="loadingState" style="display: none">
         <div class="loading-container">

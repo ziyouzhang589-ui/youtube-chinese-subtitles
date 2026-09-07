@@ -130,6 +130,16 @@ Upstream, the side panel translated on its own. Opening it, switching videos, re
 
 Only the cue being spoken and a five-cue look-ahead, in requests of three cues each. A cue is a short phrase, not a paragraph, so a video you open and abandon costs at most a couple of small calls. Cached cues are never re-sent: the background worker checks the cache when queueing, and again immediately before each request.
 
+### The two costs are separate
+
+| Action | What it spends |
+| --- | --- |
+| Pressing **获取字幕** in the side panel | One Supadata credit for that video |
+| Pressing the subtitle button on the player | Supadata, if the transcript is not fetched yet, plus DeepSeek for the translation |
+| Opening the panel, switching videos, reloading, scrolling | Nothing |
+
+Subtitles and their translation are two separate purchases, so each waits for you to ask. Opening the panel on a video whose transcript has not been fetched shows its title and a **获取字幕** button and fetches nothing, so a video in a language you already read, or a visit just to check your notes, costs nothing at all. A video already fetched (the last 20, within 30 days) opens straight from cache, because that is free.
+
 ### Where the state lives
 
 | State | Stored in | Cleared when |

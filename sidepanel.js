@@ -214,7 +214,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
   }
   if (message.action === "subtitleTrackUpdated") {
-    handleSubtitleTrackUpdate(message.videoId, message.track, message.mode);
+    // Switching subtitles on in the player fetches and caches the transcript.
+    // If this panel is still sitting on the ready state, pick that up rather
+    // than asking for a click that would only re-read the cache anyway.
+    if (!currentTranscript && message.videoId === currentVideoId) {
+      startDigest(currentVideoId, currentVideoUrl);
+    } else {
+      handleSubtitleTrackUpdate(message.videoId, message.track, message.mode);
+    }
     setTranslatingSpinner(false);
     sendResponse({ success: true });
   }
@@ -322,6 +329,11 @@ function setupEventListeners() {
   });
 
   // Transcript actions
+  // The one click that authorizes spending a Supadata credit.
+  document
+    .getElementById("fetchTranscriptBtn")
+    ?.addEventListener("click", loadTranscriptForCurrentVideo);
+
   document
     .getElementById("copyTranscriptBtn")
     ?.addEventListener("click", copyTranscript);
@@ -564,6 +576,22 @@ async function startDigest(videoId, videoUrl) {
     videoInfo.style.display = "block";
   }
 
+  // Fetching the transcript is what spends a Supadata credit, so it waits for
+  // a deliberate click. Merely having this panel open while browsing YouTube
+  // used to spend one credit per video opened, even for a video whose language
+  // the reader already understands and never asked anything about.
+  showState("ready");
+  return;
+}
+
+/**
+ * Fetches the transcript for the video the panel is showing. Reached only from
+ * the button on the ready state, which is the click that authorizes the spend.
+ */
+async function loadTranscriptForCurrentVideo() {
+  const videoId = currentVideoId;
+  if (!videoId) return;
+
   showState("loading");
   updateLoading("Fetching transcript", "");
 
@@ -572,17 +600,23 @@ async function startDigest(videoId, videoUrl) {
     videoId: videoId,
   });
 
+  // The reader may have moved on while Supadata was answering.
+  if (videoId !== currentVideoId) return;
+
   if (!transcriptResult.success) {
+    // Retrying is the reader's call, and it repeats the same authorized spend.
     if (transcriptResult.error === "NO_SUPADATA_KEY") {
       showError(
         "API key missing",
-        "Add your Supadata API key in YouTube Digest Settings.",
+        "Add your Supadata API key in YouTube中文字幕及摘要 Settings.",
+        loadTranscriptForCurrentVideo,
       );
       return;
     }
     showError(
       "No transcript found",
       transcriptResult.message || transcriptResult.error,
+      loadTranscriptForCurrentVideo,
     );
     return;
   }
@@ -872,6 +906,8 @@ function showState(state) {
     state === "loading" ? "block" : "none";
   document.getElementById("errorState").style.display =
     state === "error" ? "block" : "none";
+  const readyEl = document.getElementById("readyState");
+  if (readyEl) readyEl.style.display = state === "ready" ? "flex" : "none";
   const uploadEl = document.getElementById("uploadState");
   if (uploadEl) uploadEl.style.display = "none"; // Upload state removed — always hidden
   document.getElementById("resultsState").style.display =
@@ -894,8 +930,11 @@ function updateLoading(title, subtitle) {
   document.getElementById("loadingSubtext").textContent = subtitle;
 }
 
-function showError(title, message) {
-  errorAction = null;
+function showError(title, message, retry = null) {
+  // Try Again has to repeat the action that failed. Without this, a failed
+  // fetch fell back to reopening the video, which now stops at the ready
+  // state and would look like the button did nothing.
+  errorAction = retry;
   showState("error");
   document.getElementById("errorTitle").textContent = title;
   document.getElementById("errorMessage").textContent = message;
