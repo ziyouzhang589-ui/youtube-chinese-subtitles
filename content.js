@@ -25,6 +25,7 @@ const debugLog = (...args) => {
 let ytdNoteButton = null;
 let ytdNoteButtonTimer = null;
 let ytdNoteKeyboardListenerAdded = false;
+let ytdFullscreenListenerAdded = false;
 let ytdNoteButtonRetryTimer = null;
 let ytdDigestButton = null;
 let digestButtonObserver = null;
@@ -41,6 +42,7 @@ let ytdSubtitleVideoId = "";
 let ytdSubtitleGeneration = 0;
 let ytdSubtitleLastPrefetchAt = 0;
 let ytdSubtitleRetryTimer = null;
+let ytdIsFullscreen = false;
 
 // ============================================================
 // INITIALIZATION
@@ -66,6 +68,38 @@ function init() {
   setupButtonObserver();
   setupDigestButtonResizeListener();
   setupPlayerSubtitlesForCurrentVideo();
+  setupFullscreenPanelHiding();
+}
+
+/**
+ * Chrome does not fold the side panel away when a video goes fullscreen: the
+ * fullscreen content simply fills whatever room is left beside the panel. Ask
+ * the background worker to close it, and to put it back on the way out.
+ */
+function setupFullscreenPanelHiding() {
+  if (ytdFullscreenListenerAdded) return;
+  ytdFullscreenListenerAdded = true;
+  // Safari-prefixed variant included because YouTube still emits it on
+  // some paths through its own player controls.
+  ["fullscreenchange", "webkitfullscreenchange"].forEach((eventName) =>
+    document.addEventListener(eventName, handleFullscreenChange),
+  );
+}
+
+function handleFullscreenChange() {
+  const isFullscreen = !!(
+    document.fullscreenElement || document.webkitFullscreenElement
+  );
+  // Both events fire on some paths; only act on a real transition.
+  if (isFullscreen === ytdIsFullscreen) return;
+  ytdIsFullscreen = isFullscreen;
+  chrome.runtime
+    .sendMessage({
+      action: isFullscreen
+        ? "hideSidePanelForFullscreen"
+        : "restoreSidePanelAfterFullscreen",
+    })
+    .catch(() => {});
 }
 
 /**
@@ -1251,6 +1285,8 @@ document.addEventListener("yt-navigate-finish", () => {
 
 // Pure helpers exposed only for the repository's Node tests.
 globalThis.__YTD_PLAYER_SUBTITLES_TESTING__ = {
+  setupFullscreenPanelHiding,
+  handleFullscreenChange,
   normalizePlayerSubtitleMode,
   findPlayerSubtitleCue,
   subtitleModeLabel,

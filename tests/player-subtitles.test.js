@@ -82,6 +82,7 @@ class FakeNode {
  */
 function loadPlayer({ videoId = "abc12345678", pathname = "/watch" } = {}) {
   const messages = [];
+  const documentListeners = {};
   const player = new FakeNode();
   player.id = "movie_player";
   const video = new FakeNode("video");
@@ -95,7 +96,10 @@ function loadPlayer({ videoId = "abc12345678", pathname = "/watch" } = {}) {
     URL,
     document: {
       readyState: "complete",
-      addEventListener() {},
+      fullscreenElement: null,
+      addEventListener(name, handler) {
+        (documentListeners[name] ||= []).push(handler);
+      },
       querySelector(selector) {
         if (selector.includes("movie_player") || selector.includes("html5-video-player")) {
           return player;
@@ -153,6 +157,10 @@ function loadPlayer({ videoId = "abc12345678", pathname = "/watch" } = {}) {
     sandbox,
     helpers: sandbox.__YTD_PLAYER_SUBTITLES_TESTING__,
     messages,
+    setFullscreen(element) {
+      sandbox.document.fullscreenElement = element;
+      (documentListeners.fullscreenchange || []).forEach((handler) => handler());
+    },
     player,
     video,
     setLocation(nextVideoId) {
@@ -395,4 +403,46 @@ test("leaving the watch page removes the subtitle UI and retires the session", a
     player.messages.map((message) => message.action),
     ["resetSubtitleSession"],
   );
+});
+
+
+test("entering fullscreen asks for the panel, leaving asks for it back", async () => {
+  const player = loadPlayer();
+  player.helpers.setupFullscreenPanelHiding();
+  player.messages.length = 0;
+
+  player.setFullscreen({});
+  await settle();
+  assert.deepEqual(
+    player.messages.map((message) => message.action),
+    ["hideSidePanelForFullscreen"],
+  );
+
+  player.messages.length = 0;
+  player.setFullscreen(null);
+  await settle();
+  assert.deepEqual(
+    player.messages.map((message) => message.action),
+    ["restoreSidePanelAfterFullscreen"],
+  );
+});
+
+test("only a real fullscreen transition sends a message", async () => {
+  const player = loadPlayer();
+  player.helpers.setupFullscreenPanelHiding();
+  // Registering twice must not double every message either.
+  player.helpers.setupFullscreenPanelHiding();
+  player.messages.length = 0;
+
+  // YouTube emits both the standard and the prefixed event on some paths, so
+  // the same state arriving twice must stay one message.
+  player.setFullscreen({});
+  player.setFullscreen({});
+  await settle();
+  assert.equal(player.messages.length, 1);
+
+  player.setFullscreen(null);
+  player.setFullscreen(null);
+  await settle();
+  assert.equal(player.messages.length, 2);
 });

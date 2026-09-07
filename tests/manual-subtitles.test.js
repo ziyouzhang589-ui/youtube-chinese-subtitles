@@ -715,3 +715,75 @@ test("a rate-limited fetch tells the reader which limit was hit", async () => {
   const bareResult = await bare.send({ action: "fetchTranscript", videoId: VIDEO });
   assert.match(bareResult.message, /dash\.supadata\.ai/);
 });
+
+const fullscreenTabs = (bg) => Array.from(bg.helpers.getPanelsHiddenForFullscreen());
+
+test("fullscreen closes an open panel and reopens it on the way out", async () => {
+  const bg = loadBackground();
+  bg.clickAction({ id: TAB });
+  await settle();
+  assert.deepEqual(openTabs(bg), [TAB]);
+
+  await bg.send({ action: "hideSidePanelForFullscreen" }, { tab: { id: TAB } });
+  await settle();
+  assert.ok(bg.sidePanelOps.some((op) => op.op === "close" && op.tabId === TAB));
+  // openSidePanelTabs stays an honest record of what is on screen, so the
+  // toolbar toggle still opens rather than tries to close.
+  assert.deepEqual(openTabs(bg), []);
+  assert.deepEqual(fullscreenTabs(bg), [TAB]);
+
+  bg.sidePanelOps.length = 0;
+  await bg.send({ action: "restoreSidePanelAfterFullscreen" }, { tab: { id: TAB } });
+  await settle();
+  assert.ok(bg.sidePanelOps.some((op) => op.op === "open" && op.tabId === TAB));
+  assert.deepEqual(openTabs(bg), [TAB]);
+  assert.deepEqual(fullscreenTabs(bg), [], "nothing left pending");
+});
+
+test("fullscreen with the panel already closed changes nothing", async () => {
+  const bg = loadBackground();
+
+  await bg.send({ action: "hideSidePanelForFullscreen" }, { tab: { id: TAB } });
+  await bg.send({ action: "restoreSidePanelAfterFullscreen" }, { tab: { id: TAB } });
+  await settle();
+
+  assert.deepEqual(openTabs(bg), [], "a closed panel is not opened by fullscreen");
+  assert.equal(
+    bg.sidePanelOps.filter((op) => op.op === "open").length,
+    0,
+    "leaving fullscreen must not open a panel the reader never opened",
+  );
+});
+
+test("closing the panel during fullscreen cancels the restore", async () => {
+  const bg = loadBackground();
+  bg.clickAction({ id: TAB });
+  await settle();
+  await bg.send({ action: "hideSidePanelForFullscreen" }, { tab: { id: TAB } });
+  await settle();
+
+  // The reader clicks the toolbar icon while fullscreen: a deliberate choice
+  // that must outrank our pending restore.
+  bg.clickAction({ id: TAB });
+  await settle();
+  assert.deepEqual(fullscreenTabs(bg), []);
+
+  bg.sidePanelOps.length = 0;
+  await bg.send({ action: "restoreSidePanelAfterFullscreen" }, { tab: { id: TAB } });
+  await settle();
+  assert.equal(
+    bg.sidePanelOps.filter((op) => op.op === "open").length,
+    0,
+    "the override holds",
+  );
+});
+
+test("a page cannot close another tab's panel", async () => {
+  const bg = loadBackground();
+  bg.clickAction({ id: TAB });
+  await settle();
+
+  await bg.send({ action: "hideSidePanelForFullscreen" }, { tab: { id: TAB + 1 } });
+  await settle();
+  assert.deepEqual(openTabs(bg), [TAB], "only the sender's own tab is touched");
+});

@@ -803,6 +803,12 @@ const supportsSidePanelClose = typeof chrome.sidePanel?.close === "function";
  */
 const openSidePanelTabs = new Set();
 
+// Tabs whose panel we closed because the video went fullscreen, so we know to
+// put it back afterwards. Kept apart from openSidePanelTabs, which stays an
+// honest record of what is actually on screen so the toolbar toggle keeps
+// working while fullscreen.
+const panelsHiddenForFullscreen = new Set();
+
 const sidePanelStateReady = (async () => {
   try {
     const stored = await chrome.storage.session.get(SIDE_PANEL_SESSION_KEY);
@@ -861,6 +867,9 @@ function closeSidePanelForTab(tabId) {
 chrome.action.onClicked.addListener((tab) => {
   const tabId = tab?.id;
   if (!Number.isInteger(tabId)) return;
+  // Touching the icon during fullscreen is a deliberate override, so drop any
+  // pending restore rather than reopening the panel behind the reader later.
+  panelsHiddenForFullscreen.delete(tabId);
   if (supportsSidePanelClose && openSidePanelTabs.has(tabId)) {
     closeSidePanelForTab(tabId);
     return;
@@ -886,6 +895,7 @@ if (typeof chrome.sidePanel?.onClosed?.addListener === "function") {
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  panelsHiddenForFullscreen.delete(tabId);
   markSidePanelClosed(tabId);
   if (subtitleSession?.tabId === tabId) endSubtitleSession();
 });
@@ -895,6 +905,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // which must not disturb a panel or a translation the user already switched on.
 chrome.runtime.onStartup.addListener(() => {
   openSidePanelTabs.clear();
+  panelsHiddenForFullscreen.clear();
   subtitleSession = null;
   subtitleWorkspace = null;
   subtitleQueue.pending = [];
@@ -1122,6 +1133,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === "openOptions") {
     chrome.runtime.openOptionsPage();
+    sendResponse({ success: true });
+    return false;
+  }
+
+  // The video went fullscreen. Chrome leaves the panel in place and simply
+  // gives the fullscreen content the room beside it, so close it ourselves.
+  if (message.action === "hideSidePanelForFullscreen") {
+    const tabId = sender.tab?.id;
+    if (
+      Number.isInteger(tabId) &&
+      supportsSidePanelClose &&
+      openSidePanelTabs.has(tabId)
+    ) {
+      panelsHiddenForFullscreen.add(tabId);
+      closeSidePanelForTab(tabId);
+    }
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (message.action === "restoreSidePanelAfterFullscreen") {
+    const tabId = sender.tab?.id;
+    // Best effort. sidePanel.open() wants a user gesture, and leaving
+    // fullscreen with Esc carries none, so this can be refused. The panel then
+    // stays closed and the toolbar icon opens it, rather than the reader being
+    // left with a broken-looking extension.
+    if (Number.isInteger(tabId) && panelsHiddenForFullscreen.delete(tabId)) {
+      openSidePanelForTab(tabId).catch(() => {});
+    }
     sendResponse({ success: true });
     return false;
   }
@@ -2418,6 +2458,7 @@ globalThis.__YTD_TRANSLATION_TESTING__ = {
   buildSubtitleTrack,
   getSubtitleSession: () => subtitleSession,
   getOpenSidePanelTabs: () => [...openSidePanelTabs],
+  getPanelsHiddenForFullscreen: () => [...panelsHiddenForFullscreen],
   markSidePanelOpen,
   markSidePanelClosed,
 };

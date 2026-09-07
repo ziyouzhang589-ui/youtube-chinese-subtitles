@@ -124,6 +124,8 @@ Upstream, the side panel translated on its own. Opening it, switching videos, re
 
 **The two switches are independent.** Closing the side panel does not turn off subtitles you enabled on the player, and vice versa. The player keeps translating with the panel closed, because the translation queue lives in the background worker.
 
+**Fullscreen hides the panel.** Chrome does not fold the side panel away by itself when a video goes fullscreen; it just gives the fullscreen content whatever room is left beside it. The panel is closed on the way in and reopened on the way out. Reopening is best effort, because Chrome wants a user gesture to open a side panel and leaving fullscreen with Esc carries none. If it is refused the panel stays closed and the toolbar icon opens it.
+
 **The side panel is manual too.** Click the toolbar icon to open it and click again to close it. It stays open as you move between YouTube videos, and a full browser restart returns it to closed.
 
 ### What gets translated, and when
