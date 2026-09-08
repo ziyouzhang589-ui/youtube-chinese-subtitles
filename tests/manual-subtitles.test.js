@@ -787,3 +787,31 @@ test("a page cannot close another tab's panel", async () => {
   await settle();
   assert.deepEqual(openTabs(bg), [TAB], "only the sender's own tab is touched");
 });
+
+test("a Supadata outage is named as an outage, not a bare status number", async () => {
+  // Cloudflare's 524 in front of Supadata: their origin did not answer.
+  const bg = loadBackground({ supadataStatus: 524, supadataBody: {} });
+  const result = await bg.send({ action: "fetchTranscript", videoId: VIDEO });
+
+  assert.equal(result.success, false);
+  assert.equal(result.error, "SUPADATA_UNAVAILABLE");
+  assert.match(result.message, /did not answer in time \(524\)/);
+  // The reader's first thought on any Supadata error is now "my key or my
+  // credits again", so say plainly that it is neither.
+  assert.match(result.message, /not your key or your credits/);
+  assert.match(result.message, /Try Again/);
+
+  // One request, and no automatic retry: Supadata may have finished the work
+  // that timed out, and a retry could pay for the same transcript twice.
+  assert.equal(bg.calls.supadata, 1);
+});
+
+test("a 4xx that is not one of the known cases still surfaces Supadata's words", async () => {
+  const bg = loadBackground({
+    supadataStatus: 400,
+    supadataBody: { message: "Invalid video URL" },
+  });
+  const result = await bg.send({ action: "fetchTranscript", videoId: VIDEO });
+  assert.equal(result.success, false);
+  assert.match(result.error, /Invalid video URL/);
+});

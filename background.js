@@ -1469,9 +1469,23 @@ async function fetchTranscriptFromSupadata(videoId) {
             : "Supadata rate limit reached. Wait a minute and try again, then check your remaining credits at dash.supadata.ai.",
         };
       }
-      throw new Error(
-        errorData.message || `Supadata API error: ${response.status}`,
-      );
+      const detail = supadataErrorDetail(errorData);
+      if (response.status >= 500) {
+        // 5xx, and Cloudflare's 524 in particular, mean Supadata's own server
+        // did not answer in time. Nothing about the key, the credits, or this
+        // extension is wrong, and a bare status number tells the reader none
+        // of that. Retrying is deliberately left to them: Supadata may have
+        // finished the work that timed out, so an automatic retry risks
+        // paying for the same transcript twice.
+        return {
+          success: false,
+          error: "SUPADATA_UNAVAILABLE",
+          message: detail
+            ? `Supadata did not answer in time (${response.status}): ${detail} This is on their side. Try Again in a moment.`
+            : `Supadata did not answer in time (${response.status}). This is on their side, not your key or your credits, and it is more likely on very long videos such as full movies. Try Again in a moment.`,
+        };
+      }
+      throw new Error(detail || `Supadata API error: ${response.status}`);
     }
 
     const data = await response.json();
